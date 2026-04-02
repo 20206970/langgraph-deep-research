@@ -1,119 +1,111 @@
-<template>
-  <div id="app">
-    <!-- 主容器 -->
-    <div class="container">
-      <!-- 页面头部 -->
-      <header class="header">
-        <h1>LangGraph 深度研究助手</h1>
-        <p class="subtitle">基于 LangGraph 的智能研究工作流</p>
-      </header>
+<script setup>
+import { ref } from 'vue'
+import ProgressBar from './components/ProgressBar.vue'
+import StepInput from './components/StepInput.vue'
+import StepTasks from './components/StepTasks.vue'
+import StepResearch from './components/StepResearch.vue'
+import StepReport from './components/StepReport.vue'
 
-      <!-- 主内容区域 - 多步骤研究流程 -->
-      <main class="main-content">
-        <!-- TODO: 集成各步骤组件 -->
-        <div class="placeholder">
-          <p>正在加载研究工作流...</p>
-        </div>
-      </main>
+const currentStep = ref(1)
+const topic = ref('')
+const tasks = ref([])
+const taskResults = ref([])
+const report = ref('')
+const isLoading = ref(false)
 
-      <!-- 页脚 -->
-      <footer class="footer">
-        <p>Powered by LangGraph + Vue 3</p>
-      </footer>
-    </div>
-  </div>
-</template>
+const handleTopicSubmit = (data) => {
+  topic.value = data.topic
+  tasks.value = data.tasks
+  currentStep.value = 2
+}
 
-<script>
-// 引入子组件 - 将在后续步骤中实现
-// import StepInput from './components/StepInput.vue'
-// import StepTasks from './components/StepTasks.vue'
-// import StepResearch from './components/StepResearch.vue'
-// import StepReport from './components/StepReport.vue'
-// import ProgressBar from './components/ProgressBar.vue'
+const handleTasksConfirm = () => {
+  currentStep.value = 3
+}
 
-export default {
-  name: 'App',
-  components: {
-    // StepInput,
-    // StepTasks,
-    // StepResearch,
-    // StepReport,
-    // ProgressBar
-  },
-  data() {
-    return {
-      // 研究任务状态
-      currentStep: 1,
-      researchTopic: '',
-      isResearching: false
-    }
-  },
-  methods: {
-    // 处理研究主题提交
-    handleSubmit(topic) {
-      this.researchTopic = topic
-      this.currentStep = 2
-    },
-    // 开始研究
-    startResearch() {
-      this.isResearching = true
-      this.currentStep = 3
-    }
-  }
+const handleResearchComplete = (results) => {
+  taskResults.value = results
+}
+
+const handleReportGenerated = (reportData) => {
+  report.value = reportData
+  currentStep.value = 4
+}
+
+const handleReset = () => {
+  currentStep.value = 1
+  topic.value = ''
+  tasks.value = []
+  taskResults.value = []
+  report.value = ''
 }
 </script>
 
+<template>
+  <div class="app">
+    <header class="header">
+      <h1>🔬 LangGraph 深度研究助手</h1>
+    </header>
+
+    <ProgressBar :currentStep="currentStep" :totalSteps="4" />
+
+    <main class="main">
+      <StepInput
+        v-if="currentStep === 1"
+        @submit="handleTopicSubmit"
+        :isLoading="isLoading"
+      />
+
+      <StepTasks
+        v-else-if="currentStep === 2"
+        :tasks="tasks"
+        :topic="topic"
+        @confirm="handleTasksConfirm"
+        @back="currentStep = 1"
+        :isLoading="isLoading"
+      />
+
+      <StepResearch
+        v-else-if="currentStep === 3"
+        :tasks="tasks"
+        :topic="topic"
+        @complete="handleResearchComplete"
+        @report="handleReportGenerated"
+        @back="currentStep = 2"
+        :isLoading="isLoading"
+        @update:loading="isLoading = $event"
+      />
+
+      <StepReport
+        v-else-if="currentStep === 4"
+        :report="report"
+        :tasks="tasks"
+        :topic="topic"
+        @reset="handleReset"
+      />
+    </main>
+  </div>
+</template>
+
 <style scoped>
-/* 应用容器 */
-#app {
+.app {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
 }
 
-/* 页面头部 */
 .header {
   text-align: center;
-  padding: 40px 0 32px;
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 32px;
+  padding: 32px 24px 16px;
 }
 
 .header h1 {
-  font-size: 2rem;
-  font-weight: 700;
+  font-size: 1.75rem;
   color: var(--text-primary);
-  margin-bottom: 8px;
 }
 
-.subtitle {
-  color: var(--text-secondary);
-  font-size: 1rem;
-}
-
-/* 主内容区域 */
-.main-content {
+.main {
   flex: 1;
-  padding: 16px 0;
-}
-
-/* 占位符样式 - 后续将替换为实际组件 */
-.placeholder {
-  text-align: center;
-  padding: 60px 20px;
-  background: var(--bg-secondary);
-  border-radius: var(--radius-lg);
-  color: var(--text-secondary);
-}
-
-/* 页脚 */
-.footer {
-  text-align: center;
-  padding: 24px 0;
-  border-top: 1px solid var(--border);
-  margin-top: 32px;
-  color: var(--text-secondary);
-  font-size: 0.875rem;
+  padding: 24px;
 }
 </style>
