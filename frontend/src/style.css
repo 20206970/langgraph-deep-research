@@ -1,0 +1,55 @@
+/* 全局样式变量定义 */
+:root {
+  --bg-primary: #0f172a;
+  --bg-secondary: #1e293b;
+  --accent: #3b82f6;
+  --accent-hover: #60a5fa;
+  --success: #22c55e;
+  --text-primary: #f1f5f9;
+  --text-secondary: #94a3b8;
+  --border: #334155;
+  --shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  --radius-lg: 12px;
+  --radius-md: 8px;
+  --radius-sm: 4px;
+  --transition: 300ms ease-in-out;
+}
+
+/* 全局重置 */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  min-height: 100vh;
+  line-height: 1.6;
+}
+
+/* 标题字体 - 使用衬线字体增强中文优雅感 */
+h1, h2, h3 {
+  font-family: 'Noto Serif SC', serif;
+}
+
+/* 代码字体 */
+code, pre {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* 按钮基础样式 */
+button {
+  cursor: pointer;
+  font-family: inherit;
+  transition: var(--transition);
+}
+
+/* 容器类 - 限制内容最大宽度并居中 */
+.container {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 24px;
+}
