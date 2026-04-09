@@ -2,7 +2,10 @@
 
 import json
 import sys
-from typing import Any, Dict, Iterator, Optional
+import os
+from pathlib import Path
+from datetime import datetime
+from typing import Any, Dict, Iterator, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +17,13 @@ from src.config import get_config
 from src.graph.research import get_research_graph
 from src.memory.long_term import create_long_term_memory, search_long_term_memory
 from src.memory.short_term import create_short_term_memory, get_short_term_memory
+from src.session import (
+    create_session, get_session, add_message, delete_session,
+    get_session_memory, set_session_memory, ChatMessage, SessionState,
+)
+from src.agents.router import route_intent
+from src.agents.followup import handle_followup, handle_general
+from src.memory.short_term import add_to_short_term_memory, create_short_term_memory
 
 # 配置日志
 logger.add(
@@ -22,6 +32,10 @@ logger.add(
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <4}</level> | <level>{message}</level>",
     colorize=True,
 )
+
+# 历史记录存储目录（使用绝对路径，基于项目根目录）
+HISTORY_DIR = Path(__file__).parent.parent / "research_history"
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class ResearchRequest(BaseModel):
@@ -34,6 +48,132 @@ class ResearchResponse(BaseModel):
     """研究响应"""
     report_markdown: str = Field(..., description="Markdown-formatted research report")
     todo_items: list[dict[str, Any]] = Field(default_factory=list, description="Task items")
+
+
+class HistoryItem(BaseModel):
+    """历史记录"""
+    id: str
+    topic: str
+    report: str
+    tasks: List[dict[str, Any]]
+    created_at: str
+
+
+class ChatRequest(BaseModel):
+    """Chat message request"""
+    message: str = Field(..., description="User message")
+
+
+class ChatResponse(BaseModel):
+    """Chat message response"""
+    reply: str = Field(..., description="AI reply content")
+    message_type: str = Field(default="text", description="Message type: text, research_report, task_plan")
+    tasks: Optional[List[dict]] = Field(default=None, description="Task list if applicable")
+
+
+def _save_history(topic: str, report: str, tasks: List[dict]) -> str:
+    """保存研究历史到文件"""
+    import time
+    history_id = f"research_{int(time.time() * 1000)}"
+    history_data = {
+        "id": history_id,
+        "topic": topic,
+        "report": report,
+        "tasks": tasks,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    file_path = HISTORY_DIR / f"{history_id}.json"
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(history_data, f, ensure_ascii=False, indent=2)
+    return history_id
+
+
+def _get_history_list() -> List[dict]:
+    """获取历史记录列表"""
+    history_list = []
+    for file_path in HISTORY_DIR.glob("*.json"):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                history_list.append({
+                    "id": data.get("id"),
+                    "topic": data.get("topic"),
+                    "created_at": data.get("created_at")
+                })
+        except Exception:
+            continue
+    # 按时间倒序排列
+    history_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return history_list
+
+
+def _get_history(history_id: str) -> Optional[dict]:
+    """获取单条历史记录"""
+    file_path = HISTORY_DIR / f"{history_id}.json"
+    if not file_path.exists():
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _create_plan_only(topic: str) -> dict:
+    """只生成任务规划，不执行完整研究"""
+    from src.agents import create_planner_agent
+    from langchain_openai import ChatOpenAI
+    from src.config import get_config
+
+    config = get_config()
+    llm = ChatOpenAI(
+        model=config.llm.model,
+        base_url=config.llm.base_url,
+        api_key=config.llm.api_key,
+        temperature=config.llm.temperature,
+    )
+    agent = create_planner_agent(llm)
+
+    prompt = f"""当前研究主题：{topic}
+
+请为此主题规划研究任务。"""
+
+    response = agent.invoke({"messages": [("user", prompt)]})
+    output = response.get("messages", [])[-1].content
+
+    # 解析任务
+    import re
+    match = re.search(r'\{[\s\S]*"tasks"[\s\S]*\}', output)
+    tasks = []
+    if match:
+        try:
+            data = json.loads(match.group())
+            tasks = [
+                {
+                    "id": i + 1,
+                    "title": t.get("title", f"任务{i+1}"),
+                    "intent": t.get("intent", ""),
+                    "query": t.get("query", ""),
+                }
+                for i, t in enumerate(data.get("tasks", []))
+            ]
+        except json.JSONDecodeError:
+            pass
+
+    # 如果没有任务，生成一个默认任务
+    if not tasks:
+        tasks = [{
+            "id": 1,
+            "title": "基础背景梳理",
+            "intent": "收集主题的核心背景与最新动态",
+            "query": f"{topic} 最新进展",
+        }]
+
+    # 规划阶段不生成完整报告，只返回空报告
+    return {
+        "report_markdown": "",
+        "todo_items": tasks
+    }
 
 
 def create_app() -> FastAPI:
@@ -89,9 +229,42 @@ def create_app() -> FastAPI:
         report = result.get("report", "")
         tasks = result.get("tasks", [])
 
+        # 保存到历史记录
+        _save_history(payload.topic, report, tasks)
+
         return ResearchResponse(
             report_markdown=report,
             todo_items=tasks,
+        )
+
+    @app.get("/history", response_model=List[dict])
+    def get_history():
+        """获取历史研究列表"""
+        logger.info(f"HISTORY_DIR: {HISTORY_DIR}, exists: {HISTORY_DIR.exists()}")
+        result = _get_history_list()
+        logger.info(f"History list: {result}")
+        return result
+
+    @app.get("/history/{history_id}")
+    def get_history_detail(history_id: str):
+        """获取历史研究详情"""
+        history = _get_history(history_id)
+        if not history:
+            raise HTTPException(status_code=404, detail="历史记录不存在")
+        return history
+
+    @app.post("/plan", response_model=ResearchResponse)
+    def create_plan(payload: ResearchRequest) -> ResearchResponse:
+        """只生成任务规划，不保存历史"""
+        try:
+            result = _create_plan_only(payload.topic)
+        except Exception as exc:
+            logger.exception("Planning failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        return ResearchResponse(
+            report_markdown=result["report_markdown"],
+            todo_items=result["todo_items"],
         )
 
     @app.post("/research/stream")
@@ -116,6 +289,206 @@ def create_app() -> FastAPI:
                 "Connection": "keep-alive",
             },
         )
+
+    @app.post("/sessions", response_model=SessionState)
+    def api_create_session():
+        """Create a new chat session"""
+        session = create_session()
+
+        # Create per-session short-term memory
+        config = get_config()
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(
+            model=config.llm.model,
+            base_url=config.llm.base_url,
+            api_key=config.llm.api_key,
+        )
+        memory = create_short_term_memory(llm, config.memory.short_term_max_tokens)
+        set_session_memory(session.id, memory)
+
+        # Add welcome message
+        welcome = ChatMessage(
+            role="assistant",
+            content="你好！我是 LangGraph 深度研究助手。你可以：\n\n"
+                    "- 输入任何主题，我会为你执行深度研究\n"
+                    "- 对研究结果追问或要求深入分析\n"
+                    "- 要求调整研究任务的方向\n\n"
+                    "请问你想研究什么？",
+            message_type="text",
+        )
+        add_message(session.id, welcome)
+
+        return get_session(session.id)
+
+    @app.post("/sessions/{session_id}/chat", response_model=ChatResponse)
+    def api_chat(session_id: str, payload: ChatRequest):
+        """Send a message in a chat session"""
+        session = get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="会话不存在")
+
+        user_msg = payload.message.strip()
+        if not user_msg:
+            raise HTTPException(status_code=400, detail="消息不能为空")
+
+        # Add user message to session
+        add_message(session_id, ChatMessage(role="user", content=user_msg))
+
+        # Save to session's short-term memory
+        session_mem = get_session_memory(session_id)
+
+        # Create LLM
+        config = get_config()
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(
+            model=config.llm.model,
+            base_url=config.llm.base_url,
+            api_key=config.llm.api_key,
+            temperature=config.llm.temperature,
+        )
+
+        # Route intent
+        try:
+            intent = route_intent(
+                message=user_msg,
+                has_report=session.last_report is not None,
+                has_tasks=session.last_tasks is not None,
+                llm=llm,
+            )
+        except Exception:
+            intent = "new_research"
+
+        logger.info(f"Session {session_id}: intent={intent}, message={user_msg[:50]}")
+
+        try:
+            if intent == "new_research":
+                # Execute full research
+                graph = get_research_graph()
+                result = graph.invoke({
+                    "topic": user_msg,
+                    "session_id": session_id,
+                })
+
+                report = result.get("report", "研究完成，但未能生成报告。")
+                tasks = result.get("tasks", [])
+
+                # Save to short-term memory
+                if session_mem:
+                    try:
+                        add_to_short_term_memory(session_mem, user_msg, report[:500])
+                    except Exception:
+                        pass
+
+                # Update session state
+                session.current_topic = user_msg
+                session.last_report = report
+                session.last_tasks = tasks
+
+                # Save to history
+                _save_history(user_msg, report, tasks)
+
+                ai_msg = ChatMessage(
+                    role="assistant",
+                    content=report,
+                    message_type="research_report",
+                    tasks=tasks,
+                )
+                add_message(session_id, ai_msg)
+
+                return ChatResponse(
+                    reply=report,
+                    message_type="research_report",
+                    tasks=tasks,
+                )
+
+            elif intent == "follow_up":
+                reply = handle_followup(user_msg, session, session_mem, llm)
+
+                # Save to short-term memory
+                if session_mem:
+                    try:
+                        add_to_short_term_memory(session_mem, user_msg, reply[:500])
+                    except Exception:
+                        pass
+
+                ai_msg = ChatMessage(role="assistant", content=reply, message_type="text")
+                add_message(session_id, ai_msg)
+
+                return ChatResponse(reply=reply, message_type="text")
+
+            elif intent == "refine_tasks":
+                # Execute research with context from previous tasks
+                graph = get_research_graph()
+                combined_topic = f"{session.current_topic}\n\n用户补充要求：{user_msg}\n之前任务列表：{session.last_tasks}"
+                result = graph.invoke({
+                    "topic": combined_topic,
+                    "session_id": session_id,
+                })
+
+                report = result.get("report", "研究完成，但未能生成报告。")
+                tasks = result.get("tasks", [])
+
+                if session_mem:
+                    try:
+                        add_to_short_term_memory(session_mem, user_msg, report[:500])
+                    except Exception:
+                        pass
+
+                session.last_report = report
+                session.last_tasks = tasks
+
+                _save_history(f"{session.current_topic} (refined)", report, tasks)
+
+                ai_msg = ChatMessage(
+                    role="assistant",
+                    content=report,
+                    message_type="research_report",
+                    tasks=tasks,
+                )
+                add_message(session_id, ai_msg)
+
+                return ChatResponse(
+                    reply=report,
+                    message_type="research_report",
+                    tasks=tasks,
+                )
+
+            else:  # general
+                reply = handle_general(user_msg, session_mem, llm)
+
+                if session_mem:
+                    try:
+                        add_to_short_term_memory(session_mem, user_msg, reply[:500])
+                    except Exception:
+                        pass
+
+                ai_msg = ChatMessage(role="assistant", content=reply, message_type="text")
+                add_message(session_id, ai_msg)
+
+                return ChatResponse(reply=reply, message_type="text")
+
+        except Exception as exc:
+            logger.exception(f"Chat processing failed for session {session_id}")
+            error_reply = f"处理消息时出错：{str(exc)}"
+            ai_msg = ChatMessage(role="assistant", content=error_reply, message_type="text")
+            add_message(session_id, ai_msg)
+            return ChatResponse(reply=error_reply, message_type="text")
+
+    @app.get("/sessions/{session_id}", response_model=SessionState)
+    def api_get_session(session_id: str):
+        """Get session history"""
+        session = get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return session
+
+    @app.delete("/sessions/{session_id}")
+    def api_delete_session(session_id: str):
+        """Delete a session"""
+        if not get_session(session_id):
+            raise HTTPException(status_code=404, detail="会话不存在")
+        delete_session(session_id)
+        return {"status": "ok"}
 
     return app
 
