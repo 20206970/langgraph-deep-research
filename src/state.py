@@ -17,86 +17,28 @@ class TaskItem(BaseModel):
     sources_summary: Optional[str] = Field(default=None, description="来源摘要")
 
 
-class ResearchState(BaseModel):
-    """研究工作流状态"""
-    topic: str = Field(default="", description="研究主题")
-    tasks: list[TaskItem] = Field(default_factory=list, description="任务列表")
-    task_results: list[str] = Field(default_factory=list, description="任务结果")
-    sources: list[str] = Field(default_factory=list, description="来源列表")
-    report: Optional[str] = Field(default=None, description="最终报告")
-    loop_count: int = Field(default=0, description="研究循环计数")
-    memory_context: str = Field(default="", description="记忆上下文")
+# 搜索来源结构
+class SearchSource(BaseModel):
+    """搜索来源"""
+    query: str = Field(..., description="搜索查询")
+    url: Optional[str] = Field(default=None, description="来源 URL")
+    title: Optional[str] = Field(default=None, description="来源标题")
 
 
-class ResearchStateDict(dict):
-    """LangGraph 使用的字典状态"""
+# 使用 Annotated + operator.add 支持并行节点增量写入列表
+class ResearchState(dict):
+    """研究工作流状态 - 支持并行任务"""
+    topic: str = ""
+    tasks: list = []
+    task_results: Annotated[list, operator.add] = []
+    sources: Annotated[list, operator.add] = []  # 存储 SearchSource 对象
+    report: Optional[str] = None
+    loop_count: int = 0
+    memory_context: str = ""
+    session_id: Optional[str] = None
 
-    def __init__(self, topic: str = "", **kwargs):
-        super().__init__(
-            topic=topic,
-            tasks=[],
-            task_results=[],
-            sources=[],
-            report=None,
-            loop_count=0,
-            memory_context="",
-            **kwargs
-        )
 
-    @property
-    def topic(self) -> str:
-        return self.get("topic", "")
-
-    @topic.setter
-    def topic(self, value: str):
-        self["topic"] = value
-
-    @property
-    def tasks(self) -> list[TaskItem]:
-        return self.get("tasks", [])
-
-    @tasks.setter
-    def tasks(self, value: list[TaskItem]):
-        self["tasks"] = value
-
-    @property
-    def task_results(self) -> list[str]:
-        return self.get("task_results", [])
-
-    @task_results.setter
-    def task_results(self, value: list[str]):
-        self["task_results"] = value
-
-    @property
-    def sources(self) -> list[str]:
-        return self.get("sources", [])
-
-    @sources.setter
-    def sources(self, value: list[str]):
-        self["sources"] = value
-
-    @property
-    def report(self) -> Optional[str]:
-        return self.get("report")
-
-    @report.setter
-    def report(self, value: Optional[str]):
-        self["report"] = value
-
-    @property
-    def loop_count(self) -> int:
-        return self.get("loop_count", 0)
-
-    @loop_count.setter
-    def loop_count(self, value: int):
-        self["loop_count"] = value
-
-    @property
-    def memory_context(self) -> str:
-        return self.get("memory_context", "")
-
-    @memory_context.setter
-    def memory_context(self, value: str):
-        self["memory_context"] = value
+# 别名用于类型标注
+ResearchStateDict = ResearchState
 
 
