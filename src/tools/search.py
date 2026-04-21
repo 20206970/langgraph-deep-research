@@ -293,6 +293,63 @@ def _search_arxiv(query: str, max_results: int = 5) -> dict:
         return {"results": [], "error": str(e)}
 
 
+def _search_semantic_scholar(query: str, max_results: int = 5) -> dict:
+    """
+    使用 Semantic Scholar API 搜索学术论文
+
+    Args:
+        query: 搜索查询
+        max_results: 最大结果数
+
+    Returns:
+        搜索结果字典
+    """
+    if not HTTPX_AVAILABLE:
+        return {"results": [], "error": "httpx not installed"}
+
+    try:
+        url = "https://api.semanticscholar.org/graph/v1/paper/search"
+        params = {
+            "query": query,
+            "limit": max_results,
+            "fields": "title,authors,abstract,url,year,citationCount,externalIds",
+        }
+
+        with httpx.Client(timeout=15.0) as client:
+            response = client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+        papers = data.get("data", [])
+        results = []
+        for paper in papers:
+            authors = [a.get("name", "") for a in paper.get("authors", [])]
+            abstract = paper.get("abstract", "") or ""
+            external_ids = paper.get("externalIds", {}) or {}
+            paper_url = paper.get("url", "")
+
+            # 优先使用 ArXiv 链接
+            if external_ids.get("ArXiv"):
+                paper_url = f"https://arxiv.org/abs/{external_ids['ArXiv']}"
+
+            results.append(PaperResult(
+                title=paper.get("title", "无标题"),
+                authors=authors,
+                abstract=abstract[:500],
+                url=paper_url,
+                published_date=str(paper["year"]) if paper.get("year") else None,
+                source="semantic_scholar",
+                citation_count=paper.get("citationCount"),
+            ))
+
+        if results:
+            return {"results": [r.model_dump() for r in results], "source": "semantic_scholar"}
+        return {"results": [], "error": "no results from semantic scholar"}
+
+    except Exception as e:
+        return {"results": [], "error": str(e)}
+
+
 @tool
 def search_web(query: str, max_results: int = 5) -> str:
     """
