@@ -351,6 +351,45 @@ def _search_semantic_scholar(query: str, max_results: int = 5) -> dict:
 
 
 @tool
+def search_papers(query: str, max_results: int = 5) -> str:
+    """
+    搜索学术论文，覆盖 ArXiv 和 Semantic Scholar 数据库。
+    适用于查找研究论文、学术文献、技术报告等。
+    当查询涉及学术研究、论文、算法原理等主题时优先使用此工具。
+
+    Args:
+        query: 搜索查询关键词
+        max_results: 返回结果数量，默认5条
+
+    Returns:
+        JSON 格式的论文搜索结果，包含标题、作者、摘要、URL、发表日期等
+    """
+    # 首先尝试 ArXiv
+    arxiv_result = _search_arxiv(query, max_results)
+    if arxiv_result.get("results"):
+        output = {
+            "results": arxiv_result["results"],
+            "source": arxiv_result.get("source", "arxiv"),
+        }
+        return json.dumps(output, ensure_ascii=False)
+
+    # 降级到 Semantic Scholar
+    ss_result = _search_semantic_scholar(query, max_results)
+    if ss_result.get("results"):
+        output = {
+            "results": ss_result["results"],
+            "source": ss_result.get("source", "semantic_scholar"),
+        }
+        return json.dumps(output, ensure_ascii=False)
+
+    # 所有方案都失败
+    return json.dumps({
+        "results": [],
+        "note": f"未找到与 '{query}' 相关的学术论文"
+    }, ensure_ascii=False)
+
+
+@tool
 def search_web(query: str, max_results: int = 5) -> str:
     """
     执行网络搜索，返回相关网页内容和摘要。
