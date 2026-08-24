@@ -2,7 +2,10 @@
 
 import json
 import re
+from datetime import datetime, timezone
+from hashlib import sha256
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from langchain_core.tools import tool
 from pydantic import BaseModel
@@ -57,6 +60,79 @@ class PaperResult(BaseModel):
     published_date: Optional[str] = None
     source: str  # "arxiv" | "semantic_scholar"
     citation_count: Optional[int] = None
+
+
+_TRACKING_QUERY_KEYS = {"gclid", "fbclid", "msclkid", "mc_cid", "mc_eid", "ref"}
+
+
+def canonicalize_url(url: str | None) -> str | None:
+    """Remove fragments and common tracking parameters from a source URL."""
+    if not url or not str(url).strip():
+        return None
+
+    parsed = urlsplit(str(url).strip())
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    query_pairs = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if not key.lower().startswith("utm_") and key.lower() not in _TRACKING_QUERY_KEYS
+    ]
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path,
+            urlencode(sorted(query_pairs)),
+            "",
+        )
+    )
+
+
+def normalize_sources(
+    raw_results: list[dict],
+    provider: str,
+    source_type: str,
+) -> list[dict]:
+    """Normalize external search results into bounded, traceable source snapshots."""
+    normalized = []
+    retrieved_at = datetime.now(timezone.utc).isoformat()
+    for raw in raw_results:
+        if not isinstance(raw, dict):
+            continue
+        title = str(raw.get("title") or "无标题").strip()[:500]
+        evidence_excerpt = str(raw.get("content") or raw.get("abstract") or title).strip()[:1_500]
+        canonical_url = canonicalize_url(raw.get("url"))
+        content_hash = sha256(evidence_excerpt.encode("utf-8")).hexdigest()
+        identity = f"{canonical_url or provider}|{content_hash}"
+        source_id = f"src_{sha256(identity.encode('utf-8')).hexdigest()[:20]}"
+        normalized.append(
+            {
+                "source_id": source_id,
+                "provider": provider,
+                "source_type": source_type,
+                "title": title,
+                "url": canonical_url,
+                "canonical_url": canonical_url,
+                "content": evidence_excerpt,
+                "evidence_excerpt": evidence_excerpt,
+                "content_hash": content_hash,
+                "retrieved_at": retrieved_at,
+            }
+        )
+    return normalized
+
+
+def _tool_output(result: dict, provider: str, source_type: str) -> str:
+    """Serialize standardized sources without retaining complete remote documents."""
+    output = {
+        "answer": result.get("answer"),
+        "provider": provider,
+        "results": normalize_sources(result.get("results", []), provider, source_type),
+    }
+    if result.get("note"):
+        output["note"] = result["note"]
+    return json.dumps(output, ensure_ascii=False)
 
 
 def _generate_fallback_queries(query: str) -> list[str]:
@@ -362,31 +438,24 @@ def search_papers(query: str, max_results: int = 5) -> str:
         max_results: 返回结果数量，默认5条
 
     Returns:
-        JSON 格式的论文搜索结果，包含标题、作者、摘要、URL、发表日期等
+        JSON 格式的标准化来源，包含 source_id、URL、证据摘要和抓取时间
     """
     # 首先尝试 ArXiv
     arxiv_result = _search_arxiv(query, max_results)
     if arxiv_result.get("results"):
-        output = {
-            "results": arxiv_result["results"],
-            "source": arxiv_result.get("source", "arxiv"),
-        }
-        return json.dumps(output, ensure_ascii=False)
+        return _tool_output(arxiv_result, arxiv_result.get("source", "arxiv"), "paper")
 
     # 降级到 Semantic Scholar
     ss_result = _search_semantic_scholar(query, max_results)
     if ss_result.get("results"):
-        output = {
-            "results": ss_result["results"],
-            "source": ss_result.get("source", "semantic_scholar"),
-        }
-        return json.dumps(output, ensure_ascii=False)
+        return _tool_output(ss_result, ss_result.get("source", "semantic_scholar"), "paper")
 
     # 所有方案都失败
-    return json.dumps({
-        "results": [],
-        "note": f"未找到与 '{query}' 相关的学术论文"
-    }, ensure_ascii=False)
+    return _tool_output(
+        {"results": [], "note": f"未找到与 '{query}' 相关的学术论文"},
+        "unknown",
+        "paper",
+    )
 
 
 @tool
@@ -400,7 +469,7 @@ def search_web(query: str, max_results: int = 5) -> str:
         max_results: 返回结果数量，默认5条
 
     Returns:
-        JSON 格式的搜索结果，包含标题、URL和内容摘要
+        JSON 格式的标准化来源，包含 source_id、URL、证据摘要和抓取时间
     """
     # 获取 API 配置
     api_key = None
@@ -426,12 +495,7 @@ def search_web(query: str, max_results: int = 5) -> str:
 
             # 如果有有效结果就返回
             if result.get("results"):
-                output = {
-                    "answer": result.get("answer"),
-                    "results": result["results"],
-                    "source": result.get("source", "tavily"),
-                }
-                return json.dumps(output, ensure_ascii=False)
+                return _tool_output(result, result.get("source", "tavily"), "web")
 
         # 如果配额超限，切换到 DuckDuckGo
         if quota_exceeded:
@@ -441,28 +505,18 @@ def search_web(query: str, max_results: int = 5) -> str:
     ddg_result = _search_with_duckduckgo(query, max_results)
 
     if ddg_result.get("results"):
-        output = {
-            "answer": ddg_result.get("answer"),
-            "results": ddg_result["results"],
-            "source": ddg_result.get("source", "duckduckgo"),
-        }
-        return json.dumps(output, ensure_ascii=False)
+        return _tool_output(ddg_result, ddg_result.get("source", "duckduckgo"), "web")
 
     # 降级方案 2：使用 Wikipedia
     print(f"  [降级] DuckDuckGo 无结果，切换到 Wikipedia")
     wiki_result = _search_with_wikipedia(query, max_results)
 
     if wiki_result.get("results"):
-        output = {
-            "answer": wiki_result.get("answer"),
-            "results": wiki_result["results"],
-            "source": wiki_result.get("source", "wikipedia"),
-        }
-        return json.dumps(output, ensure_ascii=False)
+        return _tool_output(wiki_result, wiki_result.get("source", "wikipedia"), "web")
 
     # 所有方案都失败
-    return json.dumps({
-        "answer": None,
-        "results": [],
-        "note": f"未找到与 '{query}' 相关的搜索结果"
-    }, ensure_ascii=False)
+    return _tool_output(
+        {"answer": None, "results": [], "note": f"未找到与 '{query}' 相关的搜索结果"},
+        "unknown",
+        "web",
+    )

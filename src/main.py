@@ -120,59 +120,21 @@ def _get_history(history_id: str) -> Optional[dict]:
 
 
 def _create_plan_only(topic: str) -> dict:
-    """只生成任务规划，不执行完整研究"""
-    from src.agents import create_planner_agent
-    from langchain_openai import ChatOpenAI
-    from src.config import get_config
+    """只生成经过 P0.1 契约校验的任务规划，不执行检索。"""
+    from src.graph.research import planner_node
 
-    config = get_config()
-    llm = ChatOpenAI(
-        model=config.llm.model,
-        base_url=config.llm.base_url,
-        api_key=config.llm.api_key,
-        temperature=config.llm.temperature,
-    )
-    agent = create_planner_agent(llm)
+    state = planner_node({"topic": topic})
+    plan = state.get("plan", {})
+    if plan.get("parse_status") == "rejected":
+        reason = plan.get("error_message") or plan.get("error_code") or "任务规划未通过校验。"
+        return {
+            "report_markdown": f"## 任务规划失败\n\n{reason}",
+            "todo_items": [],
+        }
 
-    prompt = f"""当前研究主题：{topic}
-
-请为此主题规划研究任务。"""
-
-    response = agent.invoke({"messages": [("user", prompt)]})
-    output = response.get("messages", [])[-1].content
-
-    # 解析任务
-    import re
-    match = re.search(r'\{[\s\S]*"tasks"[\s\S]*\}', output)
-    tasks = []
-    if match:
-        try:
-            data = json.loads(match.group())
-            tasks = [
-                {
-                    "id": i + 1,
-                    "title": t.get("title", f"任务{i+1}"),
-                    "intent": t.get("intent", ""),
-                    "query": t.get("query", ""),
-                }
-                for i, t in enumerate(data.get("tasks", []))
-            ]
-        except json.JSONDecodeError:
-            pass
-
-    # 如果没有任务，生成一个默认任务
-    if not tasks:
-        tasks = [{
-            "id": 1,
-            "title": "基础背景梳理",
-            "intent": "收集主题的核心背景与最新动态",
-            "query": f"{topic} 最新进展",
-        }]
-
-    # 规划阶段不生成完整报告，只返回空报告
     return {
         "report_markdown": "",
-        "todo_items": tasks
+        "todo_items": state.get("tasks", []),
     }
 
 
@@ -200,16 +162,17 @@ def create_app() -> FastAPI:
         )
 
         # 初始化短期记忆
-        from langchain_openai import ChatOpenAI
-        llm = ChatOpenAI(
-            model=config.llm.model,
-            base_url=config.llm.base_url,
-            api_key=config.llm.api_key,
-        )
+        from src.llm import create_llm
+        llm = create_llm()
         create_short_term_memory(llm, config.memory.short_term_max_tokens)
 
         logger.info(f"LangGraph Deep Researcher initialized")
         logger.info(f"LLM: {config.llm.model} @ {config.llm.base_url}")
+        logger.info(
+            f"Embeddings: {config.embeddings.provider}/{config.embeddings.model} "
+            f"on {config.embeddings.device} "
+            f"(batch={config.embeddings.batch_size}, max_length={config.embeddings.max_length})"
+        )
         logger.info(f"ChromaDB: {config.memory.long_term_persist_dir}")
 
     @app.get("/healthz")
@@ -297,12 +260,8 @@ def create_app() -> FastAPI:
 
         # Create per-session short-term memory
         config = get_config()
-        from langchain_openai import ChatOpenAI
-        llm = ChatOpenAI(
-            model=config.llm.model,
-            base_url=config.llm.base_url,
-            api_key=config.llm.api_key,
-        )
+        from src.llm import create_llm
+        llm = create_llm()
         memory = create_short_term_memory(llm, config.memory.short_term_max_tokens)
         set_session_memory(session.id, memory)
 
@@ -338,14 +297,8 @@ def create_app() -> FastAPI:
         session_mem = get_session_memory(session_id)
 
         # Create LLM
-        config = get_config()
-        from langchain_openai import ChatOpenAI
-        llm = ChatOpenAI(
-            model=config.llm.model,
-            base_url=config.llm.base_url,
-            api_key=config.llm.api_key,
-            temperature=config.llm.temperature,
-        )
+        from src.llm import create_llm
+        llm = create_llm()
 
         # Route intent
         try:

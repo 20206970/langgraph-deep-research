@@ -1,0 +1,2 @@
+{"case_id": "medical_segmentation_overview", "reason": "curl exit code 6: Could not resolve host docs.monai.io after the initial request and two retry attempts.", "source_candidate_id": "cand_monai_metrics"}
+{"case_id": "quantum_ml_maturity", "reason": "The DOI resolved to the Nature article URL, but the returned page only contained a Client Challenge response without article content; a retry failed with an SSL connection error.", "source_candidate_id": "cand_qml_review"}

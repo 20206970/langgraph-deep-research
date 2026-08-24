@@ -1,0 +1,29 @@
+{
+  "schema_version": "draft-1",
+  "dataset_id": "deep-research-v1-draft",
+  "status": "draft_requires_review_and_capture",
+  "created_at": "2026-08-24",
+  "case_count": 12,
+  "source_candidate_count": 24,
+  "claim_candidate_count": 24,
+  "source_policy": {
+    "priority": [
+      "official_documentation",
+      "peer_reviewed_or_primary_paper",
+      "standards_organization",
+      "regulator_or_public_authority"
+    ],
+    "fallback": "well-known technical blogs may be used only when a primary source is unavailable and must be marked secondary",
+    "forbidden": [
+      "unattributed summaries",
+      "search-engine snippets",
+      "model-generated URLs"
+    ]
+  },
+  "data_files": {
+    "cases": "cases.jsonl",
+    "source_candidates": "source_candidates.jsonl",
+    "claim_annotation_draft": "claim_annotation_draft.jsonl"
+  },
+  "materialization_rule": "This draft is not an offline regression dataset. A source candidate becomes a source snapshot only after a reviewer captures its bounded excerpt, canonical URL, retrieval time and SHA-256 content hash."
+}

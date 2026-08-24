@@ -1,0 +1,24 @@
+{
+  "schema_version": "1",
+  "dataset_id": "deep-research-v1",
+  "status": "ready_for_offline_regression_with_capture_gaps",
+  "materialized_at": "2026-08-24T08:38:52.782521+00:00",
+  "case_count": 12,
+  "source_snapshot_count": 21,
+  "claim_annotation_count": 24,
+  "failure_count": 2,
+  "source_policy": {
+    "priority": [
+      "official_documentation",
+      "peer_reviewed_or_primary_paper",
+      "standards_organization",
+      "regulator_or_public_authority"
+    ],
+    "fallback": "well-known technical blogs may be used only when a primary source is unavailable and must be marked secondary",
+    "forbidden": [
+      "unattributed summaries",
+      "search-engine snippets",
+      "model-generated URLs"
+    ]
+  }
+}
