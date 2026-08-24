@@ -5,7 +5,7 @@ import sys
 import os
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +14,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from src.config import get_config
-from src.graph.research import get_research_graph
+from src.graph.research import create_research_graph, get_research_graph
 from src.memory.long_term import create_long_term_memory, search_long_term_memory
 from src.memory.short_term import create_short_term_memory, get_short_term_memory
 from src.session import (
@@ -24,6 +24,8 @@ from src.session import (
 from src.agents.router import route_intent
 from src.agents.followup import handle_followup, handle_general
 from src.memory.short_term import add_to_short_term_memory, create_short_term_memory
+from src.repository import InvalidStateTransitionError, NotFoundError, RepositoryError, SQLiteRepository
+from src.state import ParseStatus, TaskItem, TaskPlan, TaskStatus
 
 # 配置日志
 logger.add(
@@ -69,6 +71,20 @@ class ChatResponse(BaseModel):
     reply: str = Field(..., description="AI reply content")
     message_type: str = Field(default="text", description="Message type: text, research_report, task_plan")
     tasks: Optional[List[dict]] = Field(default=None, description="Task list if applicable")
+
+
+class PlanUpdateRequest(BaseModel):
+    """A user-edited draft; saving it always creates a new immutable plan version."""
+
+    topic: Optional[str] = Field(default=None, max_length=1_000)
+    tasks: list[dict[str, Any]] = Field(..., min_length=1, max_length=7)
+
+
+class RunCreateRequest(BaseModel):
+    """Reference to one confirmed plan version."""
+
+    plan_id: str = Field(..., min_length=1)
+    plan_version: int = Field(..., ge=1)
 
 
 def _save_history(topic: str, report: str, tasks: List[dict]) -> str:
@@ -138,9 +154,70 @@ def _create_plan_only(topic: str) -> dict:
     }
 
 
-def create_app() -> FastAPI:
+def _generate_valid_plan(topic: str) -> TaskPlan:
+    """Generate a validated plan without running search tasks."""
+    from src.graph.research import planner_node
+
+    state = planner_node({"topic": topic})
+    plan = TaskPlan.model_validate(state.get("plan") or {})
+    if plan.parse_status == ParseStatus.REJECTED:
+        reason = plan.error_message or plan.error_code or "任务规划未通过校验。"
+        raise InvalidStateTransitionError(reason)
+    return plan
+
+
+def _edited_plan(current: dict[str, Any], payload: PlanUpdateRequest) -> TaskPlan:
+    """Validate an edited draft and reset task execution state for its new plan version."""
+    existing = TaskPlan.model_validate(current["plan"])
+    tasks = []
+    for index, raw_task in enumerate(payload.tasks, start=1):
+        task = TaskItem.model_validate(raw_task)
+        tasks.append(task.model_copy(update={"id": index, "status": TaskStatus.PLANNED}))
+    return TaskPlan(topic=(payload.topic or existing.topic), tasks=tasks)
+
+
+def _run_config(run_id: str) -> dict[str, dict[str, str]]:
+    return {"configurable": {"thread_id": run_id}}
+
+
+def _execute_persisted_run(
+    repository: SQLiteRepository,
+    graph_factory: Callable[..., Any],
+    run_id: str,
+    *,
+    retry_task_id: str | None = None,
+    resume: bool = False,
+) -> dict[str, Any]:
+    """Execute or resume a confirmed run, persisting final graph artifacts atomically afterwards."""
+    state = repository.prepare_task_retry(run_id, retry_task_id) if retry_task_id else repository.execution_state(run_id)
+    repository.mark_run_running(run_id)
+    graph = graph_factory(checkpointer=repository.checkpointer)
+    config = _run_config(run_id)
+    graph_input: dict[str, Any] | None = state
+    if resume and hasattr(graph, "get_state"):
+        snapshot = graph.get_state(config)
+        if getattr(snapshot, "values", None):
+            graph_input = None
+    result = graph.invoke(graph_input, config=config)
+    if not isinstance(result, dict):
+        raise RepositoryError("research graph must return a dictionary state")
+    return repository.persist_graph_result(run_id, result)
+
+
+def _repository_http_error(error: RepositoryError) -> HTTPException:
+    return HTTPException(status_code=404 if isinstance(error, NotFoundError) else 409, detail=str(error))
+
+
+def create_app(
+    repository: SQLiteRepository | None = None,
+    graph_factory: Callable[..., Any] = create_research_graph,
+    *,
+    initialize_services: bool = True,
+) -> FastAPI:
     """创建 FastAPI 应用"""
     app = FastAPI(title="LangGraph Deep Researcher")
+    app.state.repository = repository
+    app.state.owns_repository = repository is None
 
     app.add_middleware(
         CORSMiddleware,
@@ -154,6 +231,11 @@ def create_app() -> FastAPI:
     def init_services():
         """初始化服务"""
         config = get_config()
+        if app.state.repository is None:
+            app.state.repository = SQLiteRepository(config.storage.sqlite_path)
+
+        if not initialize_services:
+            return
 
         # 初始化长期记忆
         create_long_term_memory(
@@ -175,22 +257,129 @@ def create_app() -> FastAPI:
         )
         logger.info(f"ChromaDB: {config.memory.long_term_persist_dir}")
 
+    @app.on_event("shutdown")
+    def close_repository():
+        repository_instance = app.state.repository
+        if app.state.owns_repository and repository_instance is not None:
+            repository_instance.close()
+
+    def active_repository() -> SQLiteRepository:
+        repository_instance = app.state.repository
+        if repository_instance is None:
+            repository_instance = SQLiteRepository(get_config().storage.sqlite_path)
+            app.state.repository = repository_instance
+        return repository_instance
+
     @app.get("/healthz")
     def health_check() -> Dict[str, str]:
         return {"status": "ok"}
+
+    @app.post("/plans")
+    def create_persisted_plan(payload: ResearchRequest) -> dict[str, Any]:
+        try:
+            return active_repository().create_plan(_generate_valid_plan(payload.topic))
+        except RepositoryError as error:
+            raise _repository_http_error(error) from error
+        except Exception as error:
+            logger.exception("Plan generation failed")
+            raise HTTPException(status_code=500, detail=str(error)) from error
+
+    @app.get("/plans/{plan_id}/versions/{plan_version}")
+    def get_persisted_plan(plan_id: str, plan_version: int) -> dict[str, Any]:
+        try:
+            return active_repository().get_plan(plan_id, plan_version)
+        except RepositoryError as error:
+            raise _repository_http_error(error) from error
+
+    @app.put("/plans/{plan_id}/versions/{plan_version}")
+    def update_persisted_plan(plan_id: str, plan_version: int, payload: PlanUpdateRequest) -> dict[str, Any]:
+        try:
+            repository_instance = active_repository()
+            current = repository_instance.get_plan(plan_id, plan_version)
+            return repository_instance.update_plan(plan_id, plan_version, _edited_plan(current, payload))
+        except RepositoryError as error:
+            raise _repository_http_error(error) from error
+        except Exception as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.post("/plans/{plan_id}/versions/{plan_version}/confirm")
+    def confirm_persisted_plan(plan_id: str, plan_version: int) -> dict[str, Any]:
+        try:
+            return active_repository().confirm_plan(plan_id, plan_version)
+        except RepositoryError as error:
+            raise _repository_http_error(error) from error
+
+    @app.post("/plans/{plan_id}/versions/{plan_version}/cancel")
+    def cancel_persisted_plan(plan_id: str, plan_version: int) -> dict[str, Any]:
+        try:
+            return active_repository().cancel_plan(plan_id, plan_version)
+        except RepositoryError as error:
+            raise _repository_http_error(error) from error
+
+    @app.post("/runs")
+    def create_persisted_run(payload: RunCreateRequest) -> dict[str, Any]:
+        try:
+            repository_instance = active_repository()
+            run = repository_instance.create_run(payload.plan_id, payload.plan_version)
+            return _execute_persisted_run(repository_instance, graph_factory, run["run"]["run_id"])
+        except RepositoryError as error:
+            raise _repository_http_error(error) from error
+        except Exception as error:
+            logger.exception("Run execution failed")
+            raise HTTPException(status_code=500, detail=str(error)) from error
+
+    @app.post("/runs/{run_id}/resume")
+    def resume_persisted_run(run_id: str) -> dict[str, Any]:
+        try:
+            return _execute_persisted_run(active_repository(), graph_factory, run_id, resume=True)
+        except RepositoryError as error:
+            raise _repository_http_error(error) from error
+        except Exception as error:
+            logger.exception("Run resume failed")
+            raise HTTPException(status_code=500, detail=str(error)) from error
+
+    @app.post("/runs/{run_id}/tasks/{task_id}/retry")
+    def retry_persisted_task(run_id: str, task_id: str) -> dict[str, Any]:
+        try:
+            return _execute_persisted_run(
+                active_repository(), graph_factory, run_id, retry_task_id=task_id
+            )
+        except RepositoryError as error:
+            raise _repository_http_error(error) from error
+        except Exception as error:
+            logger.exception("Task retry failed")
+            raise HTTPException(status_code=500, detail=str(error)) from error
+
+    @app.post("/runs/{run_id}/cancel")
+    def cancel_persisted_run(run_id: str) -> dict[str, Any]:
+        try:
+            return active_repository().cancel_run(run_id)
+        except RepositoryError as error:
+            raise _repository_http_error(error) from error
+
+    @app.get("/runs/{run_id}")
+    def get_persisted_run(run_id: str) -> dict[str, Any]:
+        try:
+            return active_repository().get_run(run_id)
+        except RepositoryError as error:
+            raise _repository_http_error(error) from error
 
     @app.post("/research", response_model=ResearchResponse)
     def run_research(payload: ResearchRequest) -> ResearchResponse:
         """同步执行研究"""
         try:
-            graph = get_research_graph()
-            result = graph.invoke({"topic": payload.topic})
+            repository_instance = active_repository()
+            plan = repository_instance.create_plan(_generate_valid_plan(payload.topic))
+            repository_instance.confirm_plan(plan["plan"]["plan_id"], plan["plan"]["plan_version"])
+            created_run = repository_instance.create_run(plan["plan"]["plan_id"], plan["plan"]["plan_version"])
+            result = _execute_persisted_run(repository_instance, graph_factory, created_run["run"]["run_id"])
         except Exception as exc:
             logger.exception("Research failed")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-        report = result.get("report", "")
-        tasks = result.get("tasks", [])
+        reports = result.get("report_versions") or []
+        report = str(reports[-1].get("markdown") or "") if reports else ""
+        tasks = result.get("plan", {}).get("tasks", [])
 
         # 保存到历史记录
         _save_history(payload.topic, report, tasks)

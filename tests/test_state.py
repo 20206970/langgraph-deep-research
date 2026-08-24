@@ -67,6 +67,16 @@ def test_task_result_reducer_rejects_conflicting_parallel_writes():
         )
 
 
+def test_task_result_reducer_accepts_a_strictly_newer_retry_attempt():
+    merged = merge_task_results(
+        {"task_1": {"task_id": "task_1", "attempts": 1, "status": "failed"}},
+        {"task_1": {"task_id": "task_1", "attempts": 2, "status": "succeeded"}},
+    )
+
+    assert merged["task_1"]["attempts"] == 2
+    assert merged["task_1"]["status"] == "succeeded"
+
+
 def test_source_reducer_keeps_richer_evidence_snapshot():
     merged = merge_sources(
         {"src_1": {"source_id": "src_1", "title": "Doc", "canonical_url": "https://example.com"}},

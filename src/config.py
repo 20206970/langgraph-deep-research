@@ -49,12 +49,19 @@ class MemoryConfig(BaseModel):
     long_term_k: int = Field(default=3, description="Number of memories to retrieve")
 
 
+class StorageConfig(BaseModel):
+    """Durable storage used by plan versions, runs, and graph checkpoints."""
+
+    sqlite_path: str = Field(default="./research.db", description="SQLite database path")
+
+
 class Config(BaseSettings):
     """Main configuration"""
     search: SearchConfig = Field(default_factory=SearchConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
 
     class Config:
         env_prefix = ""
@@ -103,6 +110,7 @@ class Config(BaseSettings):
                 ),
                 long_term_k=int(os.getenv("LONG_TERM_MEMORY_K", "3")),
             ),
+            storage=StorageConfig(sqlite_path=os.getenv("RESEARCH_DB_PATH", "./research.db")),
         )
 
 

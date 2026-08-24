@@ -1,6 +1,7 @@
 import json
 
 from src.graph import research
+from src.state import ResearchRun, RunStatus, TaskItem, TaskPlan
 
 
 class FakeMessage:
@@ -147,6 +148,45 @@ def test_invalid_planner_output_does_not_dispatch_search(monkeypatch):
     assert result["report"].find("未执行检索") >= 0
     assert dispatched["summarizer"] == 0
     assert llm.repair_calls == 1
+
+
+def test_confirmed_plan_executes_without_calling_planner(monkeypatch):
+    plan = TaskPlan(
+        topic="confirmed topic",
+        tasks=[TaskItem(id=1, title="First", intent="first intent", query="first query")],
+    )
+    run = ResearchRun(
+        plan_id=plan.plan_id,
+        plan_version=plan.plan_version,
+        topic=plan.topic,
+        status=RunStatus.CONFIRMED,
+    )
+    reporter = FakeReporter()
+    _disable_memory(monkeypatch)
+    monkeypatch.setattr(research, "_create_llm", lambda: FakeLlm())
+    monkeypatch.setattr(
+        research,
+        "create_planner_agent",
+        lambda _llm: (_ for _ in ()).throw(AssertionError("confirmed plans must skip Planner")),
+    )
+    monkeypatch.setattr(research, "create_summarizer_agent", lambda _llm: FakeSummarizer())
+    monkeypatch.setattr(research, "create_reporter_agent", lambda _llm: reporter)
+
+    result = research.create_research_graph().invoke(
+        {
+            "topic": plan.topic,
+            "confirmed_plan": True,
+            "plan": plan.model_dump(mode="json"),
+            "run": run.model_dump(mode="json"),
+            "task_results": {},
+            "sources": {},
+            "task_source_refs": {},
+        }
+    )
+
+    assert result["run"]["status"] == RunStatus.SUCCEEDED.value
+    assert len(result["task_results"]) == 1
+    assert reporter.prompts
 
 
 def test_reporter_uses_plan_order_when_result_map_is_reverse_order(monkeypatch):

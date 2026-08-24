@@ -215,10 +215,18 @@ def merge_task_results(
     left: Optional[dict[str, dict[str, Any]]],
     right: Optional[dict[str, dict[str, Any]]],
 ) -> dict[str, dict[str, Any]]:
-    """Merge parallel task results and reject conflicting writes for one task."""
+    """Merge parallel results while allowing a retry with a strictly newer attempt."""
     merged = dict(left or {})
     for task_id, result in (right or {}).items():
-        if task_id in merged and merged[task_id] != result:
+        existing = merged.get(task_id)
+        if existing is not None and existing != result:
+            existing_attempts = int(existing.get("attempts") or 0)
+            incoming_attempts = int(result.get("attempts") or 0)
+            if incoming_attempts > existing_attempts:
+                merged[task_id] = result
+                continue
+            if incoming_attempts < existing_attempts:
+                continue
             raise ValueError(f"conflicting task result for {task_id}")
         merged[task_id] = result
     return merged
@@ -299,6 +307,8 @@ class ResearchState(TypedDict, total=False):
     output_diagnostics: Annotated[dict[str, dict[str, Any]], merge_output_diagnostics]
     report: str
     report_artifact: dict[str, Any]
+    confirmed_plan: bool
+    retry_task_id: Optional[str]
     loop_count: int
     memory_context: str
     session_id: Optional[str]

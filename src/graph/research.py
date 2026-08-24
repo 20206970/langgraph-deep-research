@@ -213,6 +213,33 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
     llm = None
     output = ""
 
+    # P1.1 execution starts only after the API has persisted and confirmed a plan version.
+    if state.get("confirmed_plan"):
+        try:
+            plan = TaskPlan.model_validate(state.get("plan") or {})
+            existing_run = ResearchRun.model_validate(state.get("run") or {})
+            if existing_run.status not in {RunStatus.CONFIRMED, RunStatus.RUNNING}:
+                raise ValueError("confirmed plan execution requires a confirmed or running run")
+            run = existing_run.model_copy(update={"status": RunStatus.RUNNING, "updated_at": utc_now()})
+            plan_payload = plan.model_dump(mode="json")
+            return {
+                "run": run.model_dump(mode="json"),
+                "plan": plan_payload,
+                "tasks": plan_payload["tasks"],
+                "loop_count": int(state.get("loop_count", 0)) + 1,
+            }
+        except Exception as error:
+            plan = _build_rejected_plan(topic, StructuredOutputError("CONFIRMED_PLAN_INVALID", _safe_error_message(error)))
+            run = _new_run(topic, session_id, plan, RunStatus.FAILED)
+            plan_payload = plan.model_dump(mode="json")
+            return {
+                "run": run.model_dump(mode="json"),
+                "plan": plan_payload,
+                "tasks": [],
+                "output_diagnostics": run.output_diagnostics,
+                "loop_count": int(state.get("loop_count", 0)) + 1,
+            }
+
     try:
         llm = _create_llm()
         agent = create_planner_agent(llm)
@@ -320,7 +347,10 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
     task = dict(state.get("task") or {})
     original_query = str(task.get("query") or "").strip()
     topic = str(state.get("topic") or "")
-    query_history: list[str] = []
+    previous_result = dict((state.get("task_results") or {}).get(str(task.get("task_id") or "")) or {})
+    previous_attempts = int(previous_result.get("attempts") or 0)
+    previous_queries = previous_result.get("query_history") or []
+    query_history: list[str] = [str(query) for query in previous_queries if str(query).strip()]
     last_error = ""
     repair_attempted = False
     diagnostics: dict[str, dict[str, Any]] = {}
@@ -333,7 +363,7 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
     except Exception as error:
         failed = failed_task_result(
             task,
-            1,
+            previous_attempts + 1,
             "SUMMARIZER_INITIALIZATION_FAILED",
             _safe_error_message(error),
             query_history or [original_query],
@@ -341,9 +371,10 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
         diagnostics[f"{failed.task_id}:init"] = _output_diagnostic(
             "", ParseStatus.REJECTED, "SUMMARIZER_INITIALIZATION_FAILED"
         )
-        return _result_update(failed, [], task, original_query, 1, diagnostics, source_refs)
+        return _result_update(failed, [], task, original_query, previous_attempts + 1, diagnostics, source_refs)
 
     for attempt in range(1, MAX_SEARCH_ATTEMPTS + 1):
+        cumulative_attempt = previous_attempts + attempt
         alternatives = _generate_alternative_queries(original_query, attempt)
         query = alternatives[(attempt - 1) % len(alternatives)]
         query_history.append(query)
@@ -356,7 +387,7 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
 请执行必要的检索，并严格遵循系统中的 JSON 输出契约。"""
 
         output = ""
-        diagnostic_key = f"{str(task.get('task_id') or 'unknown_task')}:{attempt}"
+        diagnostic_key = f"{str(task.get('task_id') or 'unknown_task')}:{cumulative_attempt}"
         try:
             response = agent.invoke({"messages": [("user", prompt)]})
             current_sources = _collect_tool_sources(response)
@@ -368,7 +399,7 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
                             task_id=str(task.get("task_id") or "unknown_task"),
                             source_id=source_id,
                             query=query,
-                            attempt=attempt,
+                            attempt=cumulative_attempt,
                         ).model_dump(mode="json")
                     )
             output = _strip_reasoning(_message_content(response))
@@ -376,7 +407,7 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
                 result, _ = parse_task_result(
                     output,
                     task,
-                    attempt,
+                    cumulative_attempt,
                     query,
                     available_sources=current_sources,
                 )
@@ -388,7 +419,7 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
                 result, _ = parse_task_result(
                     repaired,
                     task,
-                    attempt,
+                    cumulative_attempt,
                     query,
                     parse_status=ParseStatus.REPAIRED,
                     available_sources=current_sources,
@@ -399,7 +430,7 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
                 list(collected_sources.values()),
                 task,
                 query,
-                attempt,
+                cumulative_attempt,
                 diagnostics,
                 source_refs,
             )
@@ -414,7 +445,7 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
 
     failed = failed_task_result(
         task,
-        MAX_SEARCH_ATTEMPTS,
+        previous_attempts + MAX_SEARCH_ATTEMPTS,
         "SUMMARIZER_OUTPUT_REJECTED",
         last_error or "未获得符合结构化契约的任务结果。",
         query_history or [original_query],
@@ -424,7 +455,7 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
         list(collected_sources.values()),
         task,
         original_query,
-        MAX_SEARCH_ATTEMPTS,
+        previous_attempts + MAX_SEARCH_ATTEMPTS,
         diagnostics,
         source_refs,
     )
@@ -655,13 +686,16 @@ def _split_tasks(state: dict[str, Any]) -> list[Send] | str:
     if plan.get("parse_status") == ParseStatus.REJECTED.value:
         return "reporter"
     tasks = _ordered_tasks(state)
+    retry_task_id = str(state.get("retry_task_id") or "")
+    if retry_task_id:
+        tasks = [task for task in tasks if str(task.get("task_id") or "") == retry_task_id]
     if not tasks:
         return "reporter"
     return [Send("search_summarize", {**state, "task": task}) for task in tasks]
 
 
-def create_research_graph():
-    """Create the P0.2 research workflow graph."""
+def create_research_graph(checkpointer: Any = None):
+    """Create the research workflow, optionally backed by a durable checkpointer."""
     from src.state import ResearchState
 
     workflow = StateGraph(ResearchState)
@@ -672,14 +706,16 @@ def create_research_graph():
     workflow.add_conditional_edges("planner", _split_tasks, ["search_summarize", "reporter"])
     workflow.add_edge("search_summarize", "reporter")
     workflow.add_edge("reporter", END)
-    return workflow.compile()
+    return workflow.compile(checkpointer=checkpointer)
 
 
 _research_graph = None
 
 
-def get_research_graph():
-    """Get the cached research graph."""
+def get_research_graph(checkpointer: Any = None):
+    """Get the cached default graph or an isolated graph bound to a supplied checkpointer."""
+    if checkpointer is not None:
+        return create_research_graph(checkpointer=checkpointer)
     global _research_graph
     if _research_graph is None:
         _research_graph = create_research_graph()

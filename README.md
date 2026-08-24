@@ -31,6 +31,10 @@ cp .env.example .env
 - `OPENAI_API_KEY`
 - `TAVILY_API_KEY`
 
+持久化配置：
+
+- `RESEARCH_DB_PATH`：计划版本、运行产物和 LangGraph checkpoint 共用的 SQLite 文件，默认 `./research.db`。
+
 ### 3. 运行服务
 
 ```bash
@@ -57,6 +61,28 @@ curl -X POST http://localhost:8000/research/stream \
   -d '{"topic": "Python 异步编程最佳实践"}'
 ```
 
+### 计划确认后执行
+
+`POST /plans` 只生成并持久化计划，不会调用搜索工具。确认后才能创建运行：
+
+```bash
+# 1. 创建计划，响应中的 plan 包含 plan_id 和 plan_version
+curl -X POST http://localhost:8000/plans \
+  -H "Content-Type: application/json" \
+  -d '{"topic": "Python 异步编程最佳实践"}'
+
+# 2. 确认计划
+curl -X POST http://localhost:8000/plans/{plan_id}/versions/1/confirm
+
+# 3. 基于已确认版本执行；服务会使用 run_id 作为 checkpoint thread_id
+curl -X POST http://localhost:8000/runs \
+  -H "Content-Type: application/json" \
+  -d '{"plan_id": "{plan_id}", "plan_version": 1}'
+```
+
+失败运行可通过 `POST /runs/{run_id}/resume` 恢复；失败任务可通过
+`POST /runs/{run_id}/tasks/{task_id}/retry` 重试。重试仅执行目标任务，并追加新的报告版本。
+
 ## API 端点
 
 | 端点 | 方法 | 描述 |
@@ -64,6 +90,13 @@ curl -X POST http://localhost:8000/research/stream \
 | `/healthz` | GET | 健康检查 |
 | `/research` | POST | 同步执行研究 |
 | `/research/stream` | POST | 流式执行研究 |
+| `/plans` | POST | 生成并保存未确认计划，不执行搜索 |
+| `/plans/{plan_id}/versions/{version}` | GET / PUT | 查询计划或保存新的计划版本 |
+| `/plans/{plan_id}/versions/{version}/confirm` | POST | 确认计划版本 |
+| `/runs` | POST | 基于已确认计划执行研究 |
+| `/runs/{run_id}` | GET | 查询运行、任务尝试和报告版本 |
+| `/runs/{run_id}/resume` | POST | 从 SQLite checkpoint 恢复运行 |
+| `/runs/{run_id}/tasks/{task_id}/retry` | POST | 重试失败任务并生成新报告版本 |
 
 ## 项目来源说明
 
