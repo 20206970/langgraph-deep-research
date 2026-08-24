@@ -25,6 +25,54 @@ export async function createResearch(topic) {
   return response.data
 }
 
+export async function streamResearch(topic, onEvent, sessionId = null) {
+  const response = await fetch(`${API_BASE}/research/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ topic, session_id: sessionId })
+  })
+
+  if (!response.ok) {
+    let detail = `请求失败（${response.status}）`
+    try {
+      const body = await response.json()
+      detail = body.detail || detail
+    } catch {
+      // Keep the HTTP status when the server did not return JSON.
+    }
+    throw new Error(detail)
+  }
+  if (!response.body) throw new Error('服务端未返回 SSE 流')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  const consume = (block) => {
+    let eventType = 'message'
+    let eventId = ''
+    const dataLines = []
+    for (const line of block.split(/\r?\n/)) {
+      if (line.startsWith('event:')) eventType = line.slice(6).trim()
+      else if (line.startsWith('id:')) eventId = line.slice(3).trim()
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+    }
+    if (!dataLines.length) return
+    const data = JSON.parse(dataLines.join('\n'))
+    onEvent({ ...data, eventType, eventId })
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
+    const blocks = buffer.split(/\r?\n\r?\n/)
+    buffer = blocks.pop() || ''
+    blocks.filter(Boolean).forEach(consume)
+    if (done) break
+  }
+  if (buffer.trim()) consume(buffer)
+}
+
 export async function getHistoryList() {
   const response = await apiClient.get('/history')
   return response.data

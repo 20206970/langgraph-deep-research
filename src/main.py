@@ -14,7 +14,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from src.config import get_config
-from src.graph.research import create_research_graph, get_research_graph
+from src.graph.research import _safe_error_message, create_research_graph, get_research_graph
 from src.memory.long_term import create_long_term_memory, search_long_term_memory
 from src.memory.short_term import create_short_term_memory, get_short_term_memory
 from src.session import (
@@ -24,8 +24,10 @@ from src.session import (
 from src.agents.router import route_intent
 from src.agents.followup import handle_followup, handle_general
 from src.memory.short_term import add_to_short_term_memory, create_short_term_memory
+from src.events import EventPublisher, EventType, ResearchEvent, encode_sse, register_publisher, unregister_publisher
 from src.repository import InvalidStateTransitionError, NotFoundError, RepositoryError, SQLiteRepository
 from src.state import ParseStatus, TaskItem, TaskPlan, TaskStatus
+from src.tracing import build_trace_callbacks
 
 # 配置日志
 logger.add(
@@ -44,6 +46,7 @@ class ResearchRequest(BaseModel):
     """研究请求"""
     topic: str = Field(..., description="Research topic")
     search_api: Optional[str] = Field(default=None, description="Search API override")
+    session_id: Optional[str] = Field(default=None, description="Optional chat session to update")
 
 
 class ResearchResponse(BaseModel):
@@ -176,8 +179,31 @@ def _edited_plan(current: dict[str, Any], payload: PlanUpdateRequest) -> TaskPla
     return TaskPlan(topic=(payload.topic or existing.topic), tasks=tasks)
 
 
-def _run_config(run_id: str) -> dict[str, dict[str, str]]:
-    return {"configurable": {"thread_id": run_id}}
+def _run_config(
+    run_id: str,
+    *,
+    callbacks: list[Any] | None = None,
+    metadata: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    config: dict[str, Any] = {"configurable": {"thread_id": run_id}}
+    if callbacks:
+        config["callbacks"] = callbacks
+    if metadata:
+        config["metadata"] = metadata
+    return config
+
+
+def _trace_metadata(run: dict[str, Any], *, session_id: str | None = None) -> dict[str, str]:
+    """Build low-cardinality metadata safe to send to an optional tracer."""
+    model_versions = run.get("model_versions") or {}
+    prompt_versions = run.get("prompt_versions") or {}
+    return {
+        "run_id": str(run.get("run_id") or ""),
+        "session_id": str(session_id or ""),
+        "model_version": str(model_versions.get("default") or ""),
+        "prompt_version": str(prompt_versions.get("reporter") or ""),
+        "redacted": "true",
+    }
 
 
 def _execute_persisted_run(
@@ -191,17 +217,32 @@ def _execute_persisted_run(
     """Execute or resume a confirmed run, persisting final graph artifacts atomically afterwards."""
     state = repository.prepare_task_retry(run_id, retry_task_id) if retry_task_id else repository.execution_state(run_id)
     repository.mark_run_running(run_id)
-    graph = graph_factory(checkpointer=repository.checkpointer)
-    config = _run_config(run_id)
-    graph_input: dict[str, Any] | None = state
-    if resume and hasattr(graph, "get_state"):
-        snapshot = graph.get_state(config)
-        if getattr(snapshot, "values", None):
-            graph_input = None
-    result = graph.invoke(graph_input, config=config)
-    if not isinstance(result, dict):
-        raise RepositoryError("research graph must return a dictionary state")
-    return repository.persist_graph_result(run_id, result)
+    publisher = EventPublisher(repository, run_id)
+    register_publisher(publisher)
+    try:
+        run = state.get("run") or {}
+        metadata = _trace_metadata(run, session_id=state.get("session_id"))
+        callbacks = build_trace_callbacks(get_config().tracing, metadata)
+        graph = graph_factory(checkpointer=repository.checkpointer)
+        config = _run_config(run_id, callbacks=callbacks, metadata=metadata)
+        graph_input: dict[str, Any] | None = state
+        if resume and hasattr(graph, "get_state"):
+            snapshot = graph.get_state(config)
+            if getattr(snapshot, "values", None):
+                graph_input = None
+        result = graph.invoke(graph_input, config=config)
+        if not isinstance(result, dict):
+            raise RepositoryError("research graph must return a dictionary state")
+        return repository.persist_graph_result(run_id, result)
+    except Exception as error:
+        publisher.publish(
+            EventType.FAILED,
+            payload={"stage": "execution", "error_message": _safe_error_message(error)},
+        )
+        raise
+    finally:
+        unregister_publisher(run_id)
+        publisher.close()
 
 
 def _repository_http_error(error: RepositoryError) -> HTTPException:
@@ -421,17 +462,92 @@ def create_app(
 
     @app.post("/research/stream")
     def stream_research(payload: ResearchRequest) -> StreamingResponse:
-        """流式执行研究"""
-        graph = get_research_graph()
+        """Execute the compatibility one-click flow and emit standard SSE events."""
 
         def event_iterator() -> Iterator[str]:
+            repository_instance = active_repository()
+            publisher: EventPublisher | None = None
+            run_id = "unassigned"
             try:
-                for chunk in graph.stream({"topic": payload.topic}):
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                plan = repository_instance.create_plan(_generate_valid_plan(payload.topic))
+                confirmed = repository_instance.confirm_plan(
+                    plan["plan"]["plan_id"], plan["plan"]["plan_version"]
+                )
+                created = repository_instance.create_run(
+                    confirmed["plan"]["plan_id"], confirmed["plan"]["plan_version"]
+                )
+                run_id = created["run"]["run_id"]
+                publisher = EventPublisher(repository_instance, run_id)
+                register_publisher(publisher)
+                publisher.publish(
+                    EventType.PLAN_CONFIRMED,
+                    payload={"plan_version": confirmed["plan"]["plan_version"]},
+                    persist=False,
+                )
+                repository_instance.mark_run_running(run_id)
+                state = repository_instance.execution_state(run_id)
+                if payload.session_id:
+                    state["session_id"] = payload.session_id
+                metadata = _trace_metadata(state["run"], session_id=payload.session_id)
+                callbacks = build_trace_callbacks(get_config().tracing, metadata)
+                graph = graph_factory(checkpointer=repository_instance.checkpointer)
+                config = _run_config(run_id, callbacks=callbacks, metadata=metadata)
+                final_state: dict[str, Any] | None = None
+                for chunk in graph.stream(state, config=config, stream_mode="values"):
+                    if isinstance(chunk, dict):
+                        final_state = chunk
+                    for event in publisher.drain():
+                        yield encode_sse(event)
+                if final_state is None:
+                    raise RepositoryError("research graph produced no final state")
+                result = repository_instance.persist_graph_result(run_id, final_state)
+                for event in publisher.drain():
+                    yield encode_sse(event)
+                reports = result.get("report_versions") or []
+                report = str(reports[-1].get("markdown") or "") if reports else ""
+                if payload.session_id and get_session(payload.session_id):
+                    session = get_session(payload.session_id)
+                    session.current_topic = payload.topic
+                    session.last_report = report
+                    session.last_tasks = result.get("plan", {}).get("tasks", [])
+                    add_message(payload.session_id, ChatMessage(role="user", content=payload.topic))
+                    add_message(
+                        payload.session_id,
+                        ChatMessage(
+                            role="assistant",
+                            content=report,
+                            message_type="research_report",
+                            tasks=session.last_tasks,
+                        ),
+                    )
+                final_event = publisher.publish(
+                    EventType.COMPLETED,
+                    payload={
+                        "status": result["run"]["status"],
+                        "report_markdown": report,
+                        "report_version": reports[-1].get("report_version") if reports else None,
+                    },
+                    persist=False,
+                )
+                yield encode_sse(final_event)
             except Exception as exc:
                 logger.exception("Streaming research failed")
-                error_payload = {"type": "error", "detail": str(exc)}
-                yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+                if publisher is not None:
+                    failed_event = publisher.publish(
+                        EventType.FAILED,
+                        payload={"stage": "stream", "error_message": _safe_error_message(exc)},
+                    )
+                else:
+                    failed_event = ResearchEvent(
+                        run_id=run_id,
+                        type=EventType.FAILED,
+                        payload={"stage": "stream", "error_message": _safe_error_message(exc)},
+                    )
+                yield encode_sse(failed_event)
+            finally:
+                if publisher is not None:
+                    unregister_publisher(run_id)
+                    publisher.close()
 
         return StreamingResponse(
             event_iterator(),

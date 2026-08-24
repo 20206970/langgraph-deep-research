@@ -1,6 +1,8 @@
 import json
 
 from src.graph import research
+from src.events import EventPublisher, EventType, register_publisher, unregister_publisher
+from src.repository import SQLiteRepository
 from src.state import ResearchRun, RunStatus, TaskItem, TaskPlan
 
 
@@ -187,6 +189,52 @@ def test_confirmed_plan_executes_without_calling_planner(monkeypatch):
     assert result["run"]["status"] == RunStatus.SUCCEEDED.value
     assert len(result["task_results"]) == 1
     assert reporter.prompts
+
+
+def test_graph_publishes_task_and_run_events(monkeypatch, tmp_path):
+    plan = TaskPlan(
+        topic="event topic",
+        tasks=[TaskItem(id=1, title="First", intent="first intent", query="first query")],
+    )
+    run = ResearchRun(
+        plan_id=plan.plan_id,
+        plan_version=plan.plan_version,
+        topic=plan.topic,
+        status=RunStatus.CONFIRMED,
+    )
+    repository = SQLiteRepository(tmp_path / "graph-events.db")
+    publisher = EventPublisher(repository, run.run_id)
+    register_publisher(publisher)
+    reporter = FakeReporter()
+    _disable_memory(monkeypatch)
+    monkeypatch.setattr(research, "_create_llm", lambda: FakeLlm())
+    monkeypatch.setattr(research, "create_planner_agent", lambda _llm: AssertionError("Planner must be skipped"))
+    monkeypatch.setattr(research, "create_summarizer_agent", lambda _llm: FakeSummarizer())
+    monkeypatch.setattr(research, "create_reporter_agent", lambda _llm: reporter)
+
+    try:
+        research.create_research_graph().invoke(
+            {
+                "topic": plan.topic,
+                "confirmed_plan": True,
+                "plan": plan.model_dump(mode="json"),
+                "run": run.model_dump(mode="json"),
+                "task_results": {},
+                "sources": {},
+                "task_source_refs": {},
+            }
+        )
+        event_types = {event.type for event in repository.list_events(run.run_id)}
+        assert EventType.PLANNING in event_types
+        assert EventType.TASK_STARTED in event_types
+        assert EventType.SEARCHING in event_types
+        assert EventType.TASK_COMPLETED in event_types
+        assert EventType.REPORTING in event_types
+        assert EventType.COMPLETED in event_types
+    finally:
+        unregister_publisher(run.run_id)
+        publisher.close()
+        repository.close()
 
 
 def test_reporter_uses_plan_order_when_result_map_is_reverse_order(monkeypatch):

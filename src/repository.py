@@ -10,6 +10,7 @@ from typing import Any, Iterator
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from src.events import EventType, ResearchEvent
 from src.state import ResearchRun, RunStatus, TaskPlan, TaskStatus, utc_now
 
 
@@ -130,6 +131,42 @@ class SQLiteRepository:
             (run_id, task_id, event_type, self._json(payload), utc_now()),
         )
 
+    def append_event(self, event: ResearchEvent) -> None:
+        """Persist a structured event while keeping compatibility with the integer PK."""
+        payload = event.model_dump(mode="json")
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO event_logs(run_id, task_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    event.run_id,
+                    event.task_id,
+                    event.type.value,
+                    self._json(payload),
+                    event.timestamp,
+                ),
+            )
+
+    def list_events(self, run_id: str, *, task_id: str | None = None) -> list[ResearchEvent]:
+        """Read structured events in insertion order; legacy rows are ignored."""
+        with self._connection() as connection:
+            if task_id is None:
+                rows = connection.execute(
+                    "SELECT payload_json FROM event_logs WHERE run_id = ? ORDER BY event_id",
+                    (run_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT payload_json FROM event_logs WHERE run_id = ? AND task_id = ? ORDER BY event_id",
+                    (run_id, task_id),
+                ).fetchall()
+        events: list[ResearchEvent] = []
+        for row in rows:
+            try:
+                events.append(ResearchEvent.model_validate(self._load_json(row["payload_json"])))
+            except Exception:
+                continue
+        return events
+
     def create_plan(self, plan: TaskPlan) -> dict[str, Any]:
         if plan.parse_status.value == "rejected":
             raise InvalidStateTransitionError("rejected plans cannot be persisted for confirmation")
@@ -230,6 +267,13 @@ class SQLiteRepository:
                     (run.run_id, task.task_id, 0, self._json(task_payload), TaskStatus.CONFIRMED.value, utc_now()),
                 )
             self._event(connection, "run_created", {"plan_id": plan.plan_id, "plan_version": plan.plan_version}, run.run_id)
+        self.append_event(
+            ResearchEvent(
+                run_id=run.run_id,
+                type=EventType.PLAN_CONFIRMED,
+                payload={"plan_version": plan.plan_version},
+            )
+        )
         return self.get_run(run.run_id)
 
     def _get_run_row(self, run_id: str) -> sqlite3.Row:

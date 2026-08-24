@@ -1,6 +1,6 @@
 <script setup>
-import { ref, onMounted, nextTick } from 'vue'
-import { createSession, sendMessage } from './api/research.js'
+import { ref, computed, onMounted, nextTick } from 'vue'
+import { createSession, sendMessage, streamResearch } from './api/research.js'
 import ChatInput from './components/ChatInput.vue'
 import MessageBubble from './components/MessageBubble.vue'
 import HistoryPanel from './components/HistoryPanel.vue'
@@ -10,6 +10,26 @@ const messages = ref([])
 const isLoading = ref(false)
 const showHistory = ref(false)
 const messagesContainer = ref(null)
+const taskProgress = ref({})
+const progressItems = computed(() => Object.values(taskProgress.value))
+
+const updateTaskProgress = (event) => {
+  if (!event.task_id) return
+  const payload = event.payload || {}
+  const status = payload.status || (
+    event.type === 'task_failed' ? 'failed' :
+      event.type === 'task_completed' ? 'succeeded' : 'running'
+  )
+  taskProgress.value = {
+    ...taskProgress.value,
+    [event.task_id]: {
+      taskId: event.task_id,
+      status,
+      attempt: payload.attempt || taskProgress.value[event.task_id]?.attempt || 0,
+      error: payload.error_message || ''
+    }
+  }
+}
 
 onMounted(async () => {
   try {
@@ -38,12 +58,35 @@ const handleSend = async (text) => {
 
   // Add loading indicator
   isLoading.value = true
+  taskProgress.value = {}
   messages.value.push({ role: 'assistant', content: '', message_type: 'loading' })
   await nextTick()
   scrollToBottom()
 
   try {
-    const response = await sendMessage(sessionId.value, text)
+    const hasResearchReport = messages.value.some(msg => msg.message_type === 'research_report')
+    let response
+    if (!hasResearchReport) {
+      let streamedReport = ''
+      let streamError = ''
+      await streamResearch(text, (event) => {
+        updateTaskProgress(event)
+        if (event.type === 'completed' && event.payload?.report_markdown) {
+          streamedReport = event.payload.report_markdown
+        }
+        if (event.type === 'failed') {
+          streamError = event.payload?.error_message || '研究执行失败'
+        }
+      }, sessionId.value)
+      if (streamError && !streamedReport) throw new Error(streamError)
+      response = {
+        reply: streamedReport || '研究完成，但未生成报告。',
+        message_type: 'research_report',
+        tasks: []
+      }
+    } else {
+      response = await sendMessage(sessionId.value, text)
+    }
 
     // Replace loading message with actual response
     const lastIdx = messages.value.length - 1
@@ -111,6 +154,16 @@ const startNewChat = async () => {
         </div>
       </div>
     </main>
+
+    <section v-if="isLoading && progressItems.length" class="research-progress" aria-live="polite">
+      <div class="progress-heading">研究进度</div>
+      <div v-for="item in progressItems" :key="item.taskId" class="progress-row">
+        <span class="progress-task">{{ item.taskId.slice(0, 12) }}</span>
+        <span class="progress-status">{{ item.status }}</span>
+        <span v-if="item.attempt" class="progress-attempt">第 {{ item.attempt }} 次</span>
+        <span v-if="item.error" class="progress-error">{{ item.error }}</span>
+      </div>
+    </section>
 
     <ChatInput
       :disabled="isLoading || !sessionId"
@@ -181,6 +234,51 @@ const startNewChat = async () => {
   display: flex;
   align-items: center;
   gap: 12px;
+}
+
+.research-progress {
+  width: min(800px, calc(100% - 48px));
+  margin: 0 auto 16px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.progress-heading {
+  margin-bottom: 8px;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.progress-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  min-height: 24px;
+}
+
+.progress-task {
+  min-width: 108px;
+  color: var(--text-primary);
+  font-family: monospace;
+}
+
+.progress-status {
+  min-width: 74px;
+}
+
+.progress-attempt {
+  color: var(--text-secondary);
+}
+
+.progress-error {
+  overflow: hidden;
+  color: #fca5a5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .typing-indicator .avatar {

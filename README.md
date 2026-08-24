@@ -35,6 +35,12 @@ cp .env.example .env
 
 - `RESEARCH_DB_PATH`：计划版本、运行产物和 LangGraph checkpoint 共用的 SQLite 文件，默认 `./research.db`。
 
+可选 LangSmith Trace：
+
+- 默认关闭：将 `LANGSMITH_TRACING=true` 并配置 `LANGSMITH_API_KEY` 后启用。
+- `LANGSMITH_CAPTURE_CONTENT=false` 保持输入输出隐藏；Trace metadata 只包含运行标识、模型/Prompt 版本和脱敏标记。
+- LangSmith 未配置或不可达时自动降级，不影响本地事件和研究流程。
+
 ### 3. 运行服务
 
 ```bash
@@ -59,6 +65,14 @@ curl -X POST http://localhost:8000/research \
 curl -X POST http://localhost:8000/research/stream \
   -H "Content-Type: application/json" \
   -d '{"topic": "Python 异步编程最佳实践"}'
+```
+
+响应为标准 SSE，每个事件包含 `event`、`id` 和 JSON `data`，例如：
+
+```text
+event: task_completed
+id: evt_xxx
+data: {"event_id":"evt_xxx","run_id":"run_xxx","task_id":"task_xxx","type":"task_completed","payload":{"status":"succeeded","attempt":1}}
 ```
 
 ### 计划确认后执行
@@ -89,7 +103,7 @@ curl -X POST http://localhost:8000/runs \
 |------|------|------|
 | `/healthz` | GET | 健康检查 |
 | `/research` | POST | 同步执行研究 |
-| `/research/stream` | POST | 流式执行研究 |
+| `/research/stream` | POST | 持久化一键研究并通过标准 SSE 推送事件 |
 | `/plans` | POST | 生成并保存未确认计划，不执行搜索 |
 | `/plans/{plan_id}/versions/{version}` | GET / PUT | 查询计划或保存新的计划版本 |
 | `/plans/{plan_id}/versions/{version}/confirm` | POST | 确认计划版本 |

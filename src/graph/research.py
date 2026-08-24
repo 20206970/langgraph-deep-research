@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from typing import Any, Callable
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from src.agents import create_planner_agent, create_reporter_agent, create_summarizer_agent
+from src.events import EventType, emit_event
 from src.memory.long_term import get_long_term_memory, save_research_memory, search_long_term_memory
 from src.memory.short_term import get_memory_context, get_short_term_memory
 from src.state import (
@@ -212,6 +214,7 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
     session_id = state.get("session_id")
     llm = None
     output = ""
+    emit_event(state, EventType.PLANNING, payload={"status": "started"})
 
     # P1.1 execution starts only after the API has persisted and confirmed a plan version.
     if state.get("confirmed_plan"):
@@ -222,6 +225,7 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("confirmed plan execution requires a confirmed or running run")
             run = existing_run.model_copy(update={"status": RunStatus.RUNNING, "updated_at": utc_now()})
             plan_payload = plan.model_dump(mode="json")
+            emit_event(state, EventType.PLANNING, payload={"status": "succeeded", "task_count": len(plan.tasks)})
             return {
                 "run": run.model_dump(mode="json"),
                 "plan": plan_payload,
@@ -232,6 +236,11 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
             plan = _build_rejected_plan(topic, StructuredOutputError("CONFIRMED_PLAN_INVALID", _safe_error_message(error)))
             run = _new_run(topic, session_id, plan, RunStatus.FAILED)
             plan_payload = plan.model_dump(mode="json")
+            emit_event(
+                state,
+                EventType.FAILED,
+                payload={"stage": "planning", "error_code": "CONFIRMED_PLAN_INVALID"},
+            )
             return {
                 "run": run.model_dump(mode="json"),
                 "plan": plan_payload,
@@ -297,6 +306,14 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
         )
 
     plan_payload = plan.model_dump(mode="json")
+    if plan.parse_status == ParseStatus.REJECTED:
+        emit_event(
+            state,
+            EventType.FAILED,
+            payload={"stage": "planning", "error_code": plan.error_code or "PLANNER_REJECTED"},
+        )
+    else:
+        emit_event(state, EventType.PLANNING, payload={"status": "succeeded", "task_count": len(plan.tasks)})
     return {
         "run": run.model_dump(mode="json"),
         "plan": plan_payload,
@@ -356,6 +373,9 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
     diagnostics: dict[str, dict[str, Any]] = {}
     collected_sources: dict[str, SourceItem] = {}
     source_refs: list[dict[str, Any]] = []
+    task_id = str(task.get("task_id") or "unknown_task")
+    task_started_at = time.perf_counter()
+    emit_event(state, EventType.TASK_STARTED, task_id=task_id, payload={"status": "started"})
 
     try:
         llm = _create_llm()
@@ -371,6 +391,16 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
         diagnostics[f"{failed.task_id}:init"] = _output_diagnostic(
             "", ParseStatus.REJECTED, "SUMMARIZER_INITIALIZATION_FAILED"
         )
+        emit_event(
+            state,
+            EventType.TASK_FAILED,
+            task_id=task_id,
+            payload={
+                "status": TaskStatus.FAILED.value,
+                "attempt": previous_attempts + 1,
+                "error_code": "SUMMARIZER_INITIALIZATION_FAILED",
+            },
+        )
         return _result_update(failed, [], task, original_query, previous_attempts + 1, diagnostics, source_refs)
 
     for attempt in range(1, MAX_SEARCH_ATTEMPTS + 1):
@@ -379,6 +409,12 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
         query = alternatives[(attempt - 1) % len(alternatives)]
         query_history.append(query)
         task["query_history"] = list(query_history)
+        emit_event(
+            state,
+            EventType.SEARCHING,
+            task_id=task_id,
+            payload={"attempt": cumulative_attempt},
+        )
         prompt = f"""任务主题：{topic}
 任务名称：{task.get('title', '')}
 任务目标：{task.get('intent', '')}
@@ -425,6 +461,16 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
                     available_sources=current_sources,
                 )
             diagnostics[diagnostic_key] = _output_diagnostic(output, result.parse_status)
+            emit_event(
+                state,
+                EventType.TASK_COMPLETED,
+                task_id=task_id,
+                payload={
+                    "status": result.status.value,
+                    "attempt": cumulative_attempt,
+                    "latency_ms": int((time.perf_counter() - task_started_at) * 1000),
+                },
+            )
             return _result_update(
                 result,
                 list(collected_sources.values()),
@@ -437,11 +483,25 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
         except StructuredOutputError as error:
             last_error = f"{error.code}: {_safe_error_message(error)}"
             diagnostics[diagnostic_key] = _output_diagnostic(output, ParseStatus.REJECTED, error.code)
+            if attempt < MAX_SEARCH_ATTEMPTS:
+                emit_event(
+                    state,
+                    EventType.RETRYING,
+                    task_id=task_id,
+                    payload={"attempt": cumulative_attempt + 1, "error_code": error.code},
+                )
         except Exception as error:
             last_error = _safe_error_message(error)
             diagnostics[diagnostic_key] = _output_diagnostic(
                 output, ParseStatus.REJECTED, "SUMMARIZER_EXECUTION_FAILED"
             )
+            if attempt < MAX_SEARCH_ATTEMPTS:
+                emit_event(
+                    state,
+                    EventType.RETRYING,
+                    task_id=task_id,
+                    payload={"attempt": cumulative_attempt + 1, "error_code": "SUMMARIZER_EXECUTION_FAILED"},
+                )
 
     failed = failed_task_result(
         task,
@@ -449,6 +509,17 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
         "SUMMARIZER_OUTPUT_REJECTED",
         last_error or "未获得符合结构化契约的任务结果。",
         query_history or [original_query],
+    )
+    emit_event(
+        state,
+        EventType.TASK_FAILED,
+        task_id=task_id,
+        payload={
+            "status": TaskStatus.FAILED.value,
+            "attempt": previous_attempts + MAX_SEARCH_ATTEMPTS,
+            "error_code": failed.error_code or "SUMMARIZER_OUTPUT_REJECTED",
+            "latency_ms": int((time.perf_counter() - task_started_at) * 1000),
+        },
     )
     return _result_update(
         failed,
@@ -608,6 +679,7 @@ def reporter_node(state: dict[str, Any]) -> dict[str, Any]:
     sources = dict(state.get("sources") or {})
     output_diagnostics = dict(state.get("output_diagnostics") or {})
     reporter_diagnostics: dict[str, dict[str, Any]] = {}
+    emit_event(state, EventType.REPORTING, payload={"status": "started"})
 
     if plan.get("parse_status") == ParseStatus.REJECTED.value:
         report = _rejected_plan_report(topic, plan)
@@ -642,6 +714,11 @@ def reporter_node(state: dict[str, Any]) -> dict[str, Any]:
         run_id=run.run_id,
         markdown=report,
         status=status,
+    )
+    emit_event(
+        state,
+        EventType.COMPLETED if status == RunStatus.SUCCEEDED else EventType.FAILED,
+        payload={"status": status.value, "stage": "reporting"},
     )
 
     summaries = [

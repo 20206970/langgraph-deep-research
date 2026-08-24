@@ -55,6 +55,19 @@ class StorageConfig(BaseModel):
     sqlite_path: str = Field(default="./research.db", description="SQLite database path")
 
 
+class TracingConfig(BaseModel):
+    """Optional LangSmith tracing with conservative content capture defaults."""
+
+    enabled: bool = Field(default=False)
+    endpoint: str = Field(default="")
+    api_key: str = Field(default="")
+    project: str = Field(default="langgraph-deep-research-dev")
+    sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
+    capture_content: bool = Field(default=False)
+    retention_days: int = Field(default=14, ge=1)
+    redact_patterns: list[str] = Field(default_factory=list)
+
+
 class Config(BaseSettings):
     """Main configuration"""
     search: SearchConfig = Field(default_factory=SearchConfig)
@@ -62,6 +75,7 @@ class Config(BaseSettings):
     embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    tracing: TracingConfig = Field(default_factory=TracingConfig)
 
     class Config:
         env_prefix = ""
@@ -111,6 +125,21 @@ class Config(BaseSettings):
                 long_term_k=int(os.getenv("LONG_TERM_MEMORY_K", "3")),
             ),
             storage=StorageConfig(sqlite_path=os.getenv("RESEARCH_DB_PATH", "./research.db")),
+            tracing=TracingConfig(
+                enabled=os.getenv("LANGSMITH_TRACING", "false").lower() in {"1", "true", "yes", "on"},
+                endpoint=os.getenv("LANGSMITH_ENDPOINT", ""),
+                api_key=os.getenv("LANGSMITH_API_KEY", ""),
+                project=os.getenv("LANGSMITH_PROJECT", "langgraph-deep-research-dev"),
+                sample_rate=float(os.getenv("LANGSMITH_SAMPLE_RATE", "1.0")),
+                capture_content=os.getenv("LANGSMITH_CAPTURE_CONTENT", "false").lower()
+                in {"1", "true", "yes", "on"},
+                retention_days=int(os.getenv("LANGSMITH_RETENTION_DAYS", "14")),
+                redact_patterns=[
+                    pattern.strip()
+                    for pattern in os.getenv("LANGSMITH_REDACT_PATTERNS", "").split(",")
+                    if pattern.strip()
+                ],
+            ),
         )
 
 
