@@ -48,6 +48,21 @@ def test_citation_coverage_and_accessibility_are_explicit():
     ]
 
 
+def test_private_document_citations_are_not_treated_as_missing_public_urls():
+    access = validate_source_accessibility(
+        [
+            {
+                "source_id": "src_doc_1",
+                "source_type": "private_document",
+                "title": "Private paper",
+                "locator": "第 2 页；章节：Results",
+            }
+        ]
+    )
+
+    assert access == [{"source_id": "src_doc_1", "accessible": None, "status": "private_document"}]
+
+
 def test_citation_report_collects_task_metrics_without_network_access():
     report = build_citation_report(
         {"task_1": {"claims": [{"claim_id": "claim_1", "task_id": "task_1", "source_ids": ["src_1"], "evidence_status": "supported"}]}},

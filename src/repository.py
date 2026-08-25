@@ -11,7 +11,7 @@ from typing import Any, Iterator
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from src.events import EventType, ResearchEvent
-from src.state import ResearchRun, RunBudget, RunStatus, TaskPlan, TaskStatus, new_id, utc_now
+from src.state import DocumentScope, ResearchRun, RunBudget, RunStatus, TaskPlan, TaskStatus, new_id, utc_now
 
 
 class RepositoryError(RuntimeError):
@@ -350,6 +350,7 @@ class SQLiteRepository:
         *,
         owner_id: str = "",
         budget: RunBudget | None = None,
+        document_scope: DocumentScope | None = None,
     ) -> dict[str, Any]:
         plan_record = self.get_plan(plan_id, plan_version, owner_id=owner_id)
         if plan_record["status"] != RunStatus.CONFIRMED.value:
@@ -362,6 +363,7 @@ class SQLiteRepository:
             status=RunStatus.CONFIRMED,
             owner_id=owner_id,
             budget=budget or RunBudget(),
+            document_scope=document_scope or DocumentScope(),
         )
         payload = run.model_dump(mode="json")
         with self._connection() as connection:
@@ -506,12 +508,15 @@ class SQLiteRepository:
         report_artifact = dict(result.get("report_artifact") or {})
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT status, owner_id FROM runs WHERE run_id = ? AND owner_id = ?", (run_id, owner_id)
+                "SELECT status, owner_id, payload_json FROM runs WHERE run_id = ? AND owner_id = ?", (run_id, owner_id)
             ).fetchone()
             if row is None:
                 raise NotFoundError("run not found")
             if graph_run.owner_id != owner_id:
                 raise RepositoryError("graph result owner does not match persisted run")
+            persisted_run = ResearchRun.model_validate(self._load_json(row["payload_json"]))
+            if graph_run.document_scope != persisted_run.document_scope:
+                raise RepositoryError("graph result document scope does not match persisted run")
             if row["status"] == RunStatus.CANCELLED.value:
                 # A synchronous worker can finish after another request cancelled the run.
                 # The cancellation is terminal, so its state must never be overwritten.

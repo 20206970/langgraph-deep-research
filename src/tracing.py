@@ -35,6 +35,8 @@ def _redact_trace_value(value: Any, patterns: list[str]) -> Any:
 def build_trace_callbacks(
     config: TracingConfig,
     metadata: dict[str, str],
+    *,
+    force_hide_content: bool = False,
 ) -> list[Any]:
     """Build a LangChain tracer only when explicitly configured and usable."""
     if not config.enabled or not config.api_key:
@@ -49,8 +51,11 @@ def build_trace_callbacks(
         client_kwargs: dict[str, Any] = {
             "api_key": config.api_key,
             "tracing_sampling_rate": config.sample_rate,
-            "hide_inputs": True if not config.capture_content else redactor,
-            "hide_outputs": True if not config.capture_content else redactor,
+            # A private-document run can place source chunks in agent tool messages.
+            # Even an explicitly permissive general tracing configuration must not
+            # export those chunks to LangSmith.
+            "hide_inputs": True if force_hide_content or not config.capture_content else redactor,
+            "hide_outputs": True if force_hide_content or not config.capture_content else redactor,
             "hide_metadata": redactor,
         }
         if config.endpoint:

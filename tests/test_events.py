@@ -31,12 +31,16 @@ def test_event_redaction_and_sse_encoding():
             "authorization": "Bearer top-secret",
             "error_message": "request failed with api_key=private-value",
             "report": "private report body",
+            "source_path": "private/owner/document/source.md",
+            "evidence_excerpt": "private paper text",
             "attempt": 2,
         }
     )
     assert payload["authorization"] == "[REDACTED]"
     assert "private-value" not in payload["error_message"]
     assert payload["report"] == "[REDACTED_CONTENT]"
+    assert payload["source_path"] == "[REDACTED_CONTENT]"
+    assert payload["evidence_excerpt"] == "[REDACTED_CONTENT]"
 
     event = ResearchEvent(
         run_id="run_test",

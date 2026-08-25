@@ -1,5 +1,6 @@
 """FastAPI entry point for LangGraph Deep Research"""
 
+import inspect
 import sys
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
@@ -7,7 +8,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from src.config import get_config
 from src.auth import (
@@ -36,8 +37,11 @@ from src.state import ParseStatus, TaskItem, TaskPlan, TaskStatus, new_id
 from src.tracing import build_trace_callbacks
 from src.documents.models import DocumentDetailView, DocumentListResponse, DocumentVersionView, IngestionJobView, StorageUsageView
 from src.documents.index import DocumentIndexError, DocumentIndexService
+from src.documents.reranker import DocumentRerankerService
 from src.documents.repository import DocumentQuotaExceededError, DocumentRepository
+from src.documents.retrieval import DocumentRetrievalService
 from src.documents.storage import DocumentStorage, DocumentStorageError, DocumentTooLargeError, UnsupportedDocumentTypeError
+from src.tools.documents import create_document_search_tool
 
 # 配置日志
 logger.add(
@@ -47,7 +51,25 @@ logger.add(
     colorize=True,
 )
 
-class ResearchRequest(BaseModel):
+class DocumentSelectionRequest(BaseModel):
+    """Client intent that is resolved to immutable version IDs only at run creation."""
+
+    document_ids: list[str] = Field(default_factory=list, max_length=1_000)
+    use_all_my_documents: bool = False
+
+    @model_validator(mode="after")
+    def validate_document_selection(self) -> "DocumentSelectionRequest":
+        self.document_ids = [document_id.strip() for document_id in self.document_ids]
+        if any(not document_id for document_id in self.document_ids):
+            raise ValueError("document_ids cannot contain blank values")
+        if len(self.document_ids) != len(set(self.document_ids)):
+            raise ValueError("document_ids must be unique")
+        if self.document_ids and self.use_all_my_documents:
+            raise ValueError("document_ids and use_all_my_documents cannot be combined")
+        return self
+
+
+class ResearchRequest(DocumentSelectionRequest):
     """研究请求"""
     topic: str = Field(..., description="Research topic")
     search_api: Optional[str] = Field(default=None, description="Search API override")
@@ -88,7 +110,7 @@ class PlanUpdateRequest(BaseModel):
     tasks: list[dict[str, Any]] = Field(..., min_length=1, max_length=7)
 
 
-class RunCreateRequest(BaseModel):
+class RunCreateRequest(DocumentSelectionRequest):
     """Reference to one confirmed plan version."""
 
     plan_id: str = Field(..., min_length=1)
@@ -164,11 +186,37 @@ def _run_config(
     return config
 
 
+def _create_graph_instance(
+    graph_factory: Callable[..., Any],
+    *,
+    checkpointer: Any,
+    document_tool_factory: Callable[..., Any] | None = None,
+) -> Any:
+    """Pass the P2.5 factory to compatible graphs while preserving older test doubles."""
+
+    kwargs: dict[str, Any] = {"checkpointer": checkpointer}
+    if document_tool_factory is not None:
+        try:
+            parameters = inspect.signature(graph_factory).parameters.values()
+            supports_documents = any(
+                parameter.name == "document_tool_factory"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            supports_documents = False
+        if supports_documents:
+            kwargs["document_tool_factory"] = document_tool_factory
+    return graph_factory(**kwargs)
+
+
 def _trace_metadata(run: dict[str, Any], *, session_id: str | None = None) -> dict[str, str]:
     """Build low-cardinality metadata safe to send to an optional tracer."""
     model_versions = run.get("model_versions") or {}
     prompt_versions = run.get("prompt_versions") or {}
     budget = run.get("budget") or {}
+    document_scope = run.get("document_scope") or {}
+    document_version_count = len(document_scope.get("version_ids") or [])
     metadata = {
         "run_id": str(run.get("run_id") or ""),
         "session_id": str(session_id or ""),
@@ -178,6 +226,8 @@ def _trace_metadata(run: dict[str, Any], *, session_id: str | None = None) -> di
         "budget_max_search_attempts": str(budget.get("max_search_attempts") or ""),
         "budget_token_limit_enabled": str(budget.get("max_total_tokens") is not None).lower(),
         "budget_cost_limit_enabled": str(budget.get("max_estimated_cost") is not None).lower(),
+        "document_scope_version_count": str(document_version_count),
+        "private_document_retrieval_enabled": str(document_version_count > 0).lower(),
         "redacted": "true",
     }
     for role in ("router", "planner", "summarizer", "reporter", "repair", "judge"):
@@ -194,6 +244,7 @@ def _execute_persisted_run(
     owner_id: str,
     retry_task_id: str | None = None,
     resume: bool = False,
+    document_tool_factory: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Execute or resume a confirmed run, persisting final graph artifacts atomically afterwards."""
     state = (
@@ -207,8 +258,16 @@ def _execute_persisted_run(
     try:
         run = state.get("run") or {}
         metadata = _trace_metadata(run, session_id=state.get("session_id"))
-        callbacks = build_trace_callbacks(get_config().tracing, metadata)
-        graph = graph_factory(checkpointer=repository.checkpointer)
+        callbacks = build_trace_callbacks(
+            get_config().tracing,
+            metadata,
+            force_hide_content=bool((run.get("document_scope") or {}).get("version_ids")),
+        )
+        graph = _create_graph_instance(
+            graph_factory,
+            checkpointer=repository.checkpointer,
+            document_tool_factory=document_tool_factory,
+        )
         config = _run_config(run_id, callbacks=callbacks, metadata=metadata)
         graph_input: dict[str, Any] | None = state
         if resume and hasattr(graph, "get_state"):
@@ -242,6 +301,7 @@ def create_app(
     document_repository: DocumentRepository | None = None,
     document_storage: DocumentStorage | None = None,
     document_index: DocumentIndexService | None = None,
+    document_retrieval: DocumentRetrievalService | None = None,
 ) -> FastAPI:
     """创建 FastAPI 应用"""
     app = FastAPI(title="LangGraph Deep Researcher")
@@ -250,6 +310,7 @@ def create_app(
     app.state.document_repository = document_repository
     app.state.document_storage = document_storage
     app.state.document_index = document_index
+    app.state.document_retrieval = document_retrieval
 
     app.add_middleware(
         CORSMiddleware,
@@ -327,6 +388,33 @@ def create_app(
             index = DocumentIndexService(active_document_repository(), config.documents, config.embeddings)
             app.state.document_index = index
         return index
+
+    def active_document_retrieval() -> DocumentRetrievalService:
+        retrieval = app.state.document_retrieval
+        if retrieval is None:
+            config = get_config()
+            retrieval = DocumentRetrievalService(
+                active_document_repository(),
+                active_document_index(),
+                config.document_retrieval,
+                DocumentRerankerService(config.reranker),
+            )
+            app.state.document_retrieval = retrieval
+        return retrieval
+
+    def document_tool_factory(owner_id: str, document_scope: Any):
+        return create_document_search_tool(
+            active_document_retrieval(),
+            owner_id=owner_id,
+            document_scope=document_scope,
+        )
+
+    def resolve_document_scope(payload: DocumentSelectionRequest, owner_id: str):
+        return active_document_repository().resolve_document_scope(
+            owner_id=owner_id,
+            document_ids=payload.document_ids,
+            use_all_my_documents=payload.use_all_my_documents,
+        )
 
     def document_detail(record: dict[str, Any]) -> DocumentDetailView:
         return DocumentDetailView(
@@ -601,12 +689,14 @@ def create_app(
                 payload.plan_version,
                 owner_id=current_user.user_id,
                 budget=budget_from_config(get_config()),
+                document_scope=resolve_document_scope(payload, current_user.user_id),
             )
             return _execute_persisted_run(
                 repository_instance,
                 graph_factory,
                 run["run"]["run_id"],
                 owner_id=current_user.user_id,
+                document_tool_factory=document_tool_factory,
             )
         except RepositoryError as error:
             raise _repository_http_error(error) from error
@@ -621,7 +711,12 @@ def create_app(
     ) -> dict[str, Any]:
         try:
             return _execute_persisted_run(
-                active_repository(), graph_factory, run_id, owner_id=current_user.user_id, resume=True
+                active_repository(),
+                graph_factory,
+                run_id,
+                owner_id=current_user.user_id,
+                resume=True,
+                document_tool_factory=document_tool_factory,
             )
         except RepositoryError as error:
             raise _repository_http_error(error) from error
@@ -642,6 +737,7 @@ def create_app(
                 run_id,
                 owner_id=current_user.user_id,
                 retry_task_id=task_id,
+                document_tool_factory=document_tool_factory,
             )
         except RepositoryError as error:
             raise _repository_http_error(error) from error
@@ -686,13 +782,17 @@ def create_app(
                 plan["plan"]["plan_version"],
                 owner_id=current_user.user_id,
                 budget=budget_from_config(get_config()),
+                document_scope=resolve_document_scope(payload, current_user.user_id),
             )
             result = _execute_persisted_run(
                 repository_instance,
                 graph_factory,
                 created_run["run"]["run_id"],
                 owner_id=current_user.user_id,
+                document_tool_factory=document_tool_factory,
             )
+        except RepositoryError as error:
+            raise _repository_http_error(error) from error
         except Exception as exc:
             logger.exception("Research failed")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -749,6 +849,10 @@ def create_app(
         owner_id = current_user.user_id
         if payload.session_id and get_session(payload.session_id, owner_id) is None:
             raise HTTPException(status_code=404, detail="会话不存在")
+        try:
+            frozen_document_scope = resolve_document_scope(payload, owner_id)
+        except RepositoryError as error:
+            raise _repository_http_error(error) from error
 
         def event_iterator() -> Iterator[str]:
             repository_instance = active_repository()
@@ -764,6 +868,7 @@ def create_app(
                     confirmed["plan"]["plan_version"],
                     owner_id=owner_id,
                     budget=budget_from_config(get_config()),
+                    document_scope=frozen_document_scope,
                 )
                 run_id = created["run"]["run_id"]
                 publisher = EventPublisher(repository_instance, run_id)
@@ -778,8 +883,16 @@ def create_app(
                 if payload.session_id:
                     state["session_id"] = payload.session_id
                 metadata = _trace_metadata(state["run"], session_id=payload.session_id)
-                callbacks = build_trace_callbacks(get_config().tracing, metadata)
-                graph = graph_factory(checkpointer=repository_instance.checkpointer)
+                callbacks = build_trace_callbacks(
+                    get_config().tracing,
+                    metadata,
+                    force_hide_content=bool((state["run"].get("document_scope") or {}).get("version_ids")),
+                )
+                graph = _create_graph_instance(
+                    graph_factory,
+                    checkpointer=repository_instance.checkpointer,
+                    document_tool_factory=document_tool_factory,
+                )
                 config = _run_config(run_id, callbacks=callbacks, metadata=metadata)
                 final_state: dict[str, Any] | None = None
                 for chunk in graph.stream(state, config=config, stream_mode="values"):

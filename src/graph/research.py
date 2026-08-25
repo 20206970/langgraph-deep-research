@@ -20,6 +20,7 @@ from src.memory.long_term import get_long_term_memory, save_research_memory, sea
 from src.memory.short_term import get_memory_context, get_short_term_memory
 from src.state import (
     ParseStatus,
+    DocumentScope,
     ReportArtifact,
     ResearchRun,
     RunBudget,
@@ -84,7 +85,7 @@ def _collect_tool_sources(response: Any) -> dict[str, SourceItem]:
     for message in _response_messages(response):
         message_type = _message_field(message, "type", "")
         tool_name = _message_field(message, "name", "")
-        if message_type != "tool" or tool_name not in {"search_web", "search_papers"}:
+        if message_type != "tool" or tool_name not in {"search_web", "search_papers", "search_private_documents"}:
             continue
         try:
             payload = json.loads(_message_content(message))
@@ -113,8 +114,15 @@ def _collect_tool_sources(response: Any) -> dict[str, SourceItem]:
 
 def _collect_tool_metadata(response: Any) -> dict[str, Any]:
     """Read bounded cache/provider metadata exposed by this invocation's tool messages."""
+    def safe_int(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
     cache_hit = False
     providers: set[str] = set()
+    document_retrieval: list[dict[str, Any]] = []
     for message in _response_messages(response):
         if _message_field(message, "type", "") != "tool":
             continue
@@ -126,7 +134,27 @@ def _collect_tool_metadata(response: Any) -> dict[str, Any]:
         provider = payload.get("provider")
         if isinstance(provider, str) and provider:
             providers.add(provider)
-    return {"cache_hit": cache_hit, "providers": sorted(providers)}
+        if _message_field(message, "name", "") == "search_private_documents":
+            raw_retrieval = payload.get("retrieval")
+            if isinstance(raw_retrieval, dict):
+                document_retrieval.append(
+                    {
+                        "scope_version_count": safe_int(raw_retrieval.get("scope_version_count")),
+                        "parent_count": safe_int(raw_retrieval.get("parent_count")),
+                        "vector_candidate_count": safe_int(raw_retrieval.get("vector_candidate_count")),
+                        "bm25_candidate_count": safe_int(raw_retrieval.get("bm25_candidate_count")),
+                        "vector_status": str(raw_retrieval.get("vector_status") or "unknown")[:32],
+                        "reranker_status": str(raw_retrieval.get("reranker_status") or "unknown")[:32],
+                        "reranker_model": str(raw_retrieval.get("reranker_model") or "")[:256],
+                        "latency_ms": safe_int(raw_retrieval.get("latency_ms")),
+                        "error_code": str(raw_retrieval.get("error_code") or "")[:100] or None,
+                    }
+                )
+    return {
+        "cache_hit": cache_hit,
+        "providers": sorted(providers),
+        "document_retrieval": document_retrieval,
+    }
 
 
 def _strip_reasoning(text: str) -> str:
@@ -518,7 +546,11 @@ def _result_update(
     }
 
 
-def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
+def search_summarize_node(
+    state: dict[str, Any],
+    *,
+    document_tool_factory: Callable[[str, DocumentScope], Any] | None = None,
+) -> dict[str, Any]:
     """Execute one task and return a keyed result, never an invented fallback."""
     task = dict(state.get("task") or {})
     original_query = str(task.get("query") or "").strip()
@@ -539,6 +571,13 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
     cost_observed = False
     cost_unavailable = False
     cache_hit = False
+    persisted_run = state.get("run") or {}
+    try:
+        document_scope = DocumentScope.model_validate(
+            persisted_run.get("document_scope") or state.get("document_scope") or {}
+        )
+    except Exception:
+        document_scope = DocumentScope()
 
     def cost_snapshot() -> tuple[float | None, str]:
         if not cost_observed or cost_unavailable:
@@ -624,7 +663,14 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
 
     try:
         llm = _create_llm("summarizer")
-        agent = create_summarizer_agent(llm)
+        if document_scope.version_ids and document_tool_factory is not None:
+            document_tool = document_tool_factory(
+                str(persisted_run.get("owner_id") or state.get("owner_id") or ""),
+                document_scope,
+            )
+            agent = create_summarizer_agent(llm, document_tools=[document_tool])
+        else:
+            agent = create_summarizer_agent(llm)
     except Exception as error:
         failed = decorate_result(
             failed_task_result(
@@ -688,7 +734,8 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
 任务目标：{task.get('intent', '')}
 检索查询：{query}
 
-请执行必要的检索，并严格遵循系统中的 JSON 输出契约。"""
+请执行必要的检索，并严格遵循系统中的 JSON 输出契约。
+{"当前任务可使用已选定私有文档；私有文档的视觉增强内容不得当作原文引用。" if document_scope.version_ids else "当前任务未选择私有文档，仅使用网页、论文和笔记工具。"}"""
 
         output = ""
         diagnostic_key = f"{str(task.get('task_id') or 'unknown_task')}:{cumulative_attempt}"
@@ -697,6 +744,15 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
             current_sources = _collect_tool_sources(response)
             tool_metadata = _collect_tool_metadata(response)
             cache_hit = cache_hit or bool(tool_metadata["cache_hit"])
+            for index, retrieval_metadata in enumerate(tool_metadata["document_retrieval"], start=1):
+                retrieval_key = f"{diagnostic_key}:document_retrieval:{index}"
+                diagnostics[retrieval_key] = dict(retrieval_metadata)
+                emit_event(
+                    state,
+                    EventType.DOCUMENT_RETRIEVAL,
+                    task_id=task_id,
+                    payload=retrieval_metadata,
+                )
             record_response_usage(response, summarizer_model)
             for source_id, source in current_sources.items():
                 if source_id not in collected_sources:
@@ -908,6 +964,14 @@ def _build_report_prompt(
     results: dict[str, dict[str, Any]],
     sources: dict[str, dict[str, Any]],
 ) -> str:
+    def source_label(source: dict[str, Any]) -> str:
+        title = str(source.get("title") or source.get("source_id") or "未知来源")
+        locator = str(source.get("locator") or "").strip()
+        if source.get("source_type") == "private_document":
+            return f"{title}（{locator}）" if locator else title
+        url = source.get("canonical_url") or source.get("url")
+        return f"[{title}]({url})" if url else title
+
     task_blocks = []
     referenced_source_ids: set[str] = set()
     for index, task in enumerate(tasks, start=1):
@@ -933,9 +997,7 @@ def _build_report_prompt(
                 source = sources.get(source_id)
                 if not source:
                     continue
-                url = source.get("canonical_url") or source.get("url")
-                title = source.get("title") or source_id
-                links.append(f"[{title}]({url})" if url else f"`{source_id}`")
+                links.append(source_label(source))
             evidence_status = claim.get("evidence_status", "unverified")
             claim_lines.append(
                 f"  - 结论：{claim.get('text', '')}\n"
@@ -956,10 +1018,7 @@ def _build_report_prompt(
         source = sources.get(source_id)
         if not source:
             continue
-        url = source.get("canonical_url") or source.get("url")
-        title = source.get("title") or url or source_id
-        if url:
-            source_blocks.append(f"- [{title}]({url})")
+        source_blocks.append(f"- {source_label(source)}")
 
     return f"""研究主题：{topic}
 
@@ -991,9 +1050,13 @@ def _append_source_index(
         source = sources.get(source_id)
         if not source:
             continue
-        url = source.get("canonical_url") or source.get("url")
         title = source.get("title") or source_id
-        link = f"[{title}]({url})" if url else title
+        url = source.get("canonical_url") or source.get("url")
+        if source.get("source_type") == "private_document":
+            locator = str(source.get("locator") or "").strip()
+            link = f"{title}（{locator}）" if locator else str(title)
+        else:
+            link = f"[{title}]({url})" if url else str(title)
         source_lines.append(f"- `{source_id}`: {link}")
     if not source_lines:
         return report
@@ -1170,13 +1233,20 @@ def _split_tasks(state: dict[str, Any]) -> list[Send] | str:
     return [Send("search_summarize", {**state, "task": task}) for task in tasks]
 
 
-def create_research_graph(checkpointer: Any = None):
+def create_research_graph(
+    checkpointer: Any = None,
+    *,
+    document_tool_factory: Callable[[str, DocumentScope], Any] | None = None,
+):
     """Create the research workflow, optionally backed by a durable checkpointer."""
     from src.state import ResearchState
 
     workflow = StateGraph(ResearchState)
     workflow.add_node("planner", planner_node)
-    workflow.add_node("search_summarize", search_summarize_node)
+    workflow.add_node(
+        "search_summarize",
+        lambda state: search_summarize_node(state, document_tool_factory=document_tool_factory),
+    )
     workflow.add_node("reporter", reporter_node)
     workflow.add_edge(START, "planner")
     workflow.add_conditional_edges("planner", _split_tasks, ["search_summarize", "reporter"])

@@ -61,6 +61,11 @@ def validate_source_accessibility(
     results = []
     for source in sources:
         source_id = str(_value(source, "source_id", ""))
+        if _value(source, "source_type", "") == "private_document":
+            # Private sources resolve through the authenticated document API, not a
+            # public URL. A missing URL is therefore expected rather than an error.
+            results.append({"source_id": source_id, "accessible": None, "status": "private_document"})
+            continue
         url = _value(source, "canonical_url", None) or _value(source, "url", None)
         if not url:
             results.append({"source_id": source_id, "accessible": False, "status": "missing_url"})

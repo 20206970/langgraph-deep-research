@@ -13,7 +13,7 @@ from typing import Any, Iterator, Sequence
 from src.config import DocumentConfig
 from src.events import redact_text
 from src.repository import InvalidStateTransitionError, NotFoundError, RepositoryError
-from src.state import new_id, utc_now
+from src.state import DocumentScope, new_id, utc_now
 
 from .models import (
     DocumentChunk,
@@ -379,6 +379,74 @@ class DocumentRepository:
                 ).fetchone()
                 items.append({"document": document, "current_version": self._bool_fields(dict(current)) if current else None})
         return items, total
+
+    def resolve_document_scope(
+        self,
+        *,
+        owner_id: str,
+        document_ids: Sequence[str] = (),
+        use_all_my_documents: bool = False,
+    ) -> DocumentScope:
+        """Freeze the owner's currently retrievable versions for one research run.
+
+        Callers provide document IDs, never version IDs. This prevents a client from
+        selecting an archived version or bypassing the document lifecycle checks.
+        """
+
+        normalized_ids = [str(document_id).strip() for document_id in document_ids]
+        if any(not document_id for document_id in normalized_ids):
+            raise InvalidStateTransitionError("document IDs cannot be blank")
+        if len(normalized_ids) != len(set(normalized_ids)):
+            raise InvalidStateTransitionError("document IDs must be unique")
+        if normalized_ids and use_all_my_documents:
+            raise InvalidStateTransitionError("document IDs and all-documents selection cannot be combined")
+        if not normalized_ids and not use_all_my_documents:
+            return DocumentScope()
+
+        selection_mode = "all_my_documents" if use_all_my_documents else "explicit"
+        with self._transaction() as connection:
+            if normalized_ids:
+                placeholders = ", ".join("?" for _ in normalized_ids)
+                owned_rows = connection.execute(
+                    "SELECT document_id FROM documents WHERE owner_id = ? AND document_id IN (" + placeholders + ")",
+                    [owner_id, *normalized_ids],
+                ).fetchall()
+                owned_ids = {str(row["document_id"]) for row in owned_rows}
+                if owned_ids != set(normalized_ids):
+                    # Match the rest of the authenticated API: a foreign document is not
+                    # distinguishable from an unknown document.
+                    raise NotFoundError("document not found")
+                selection_clause = "AND documents.document_id IN (" + placeholders + ")"
+                parameters: list[Any] = [owner_id, *normalized_ids]
+            else:
+                selection_clause = ""
+                parameters = [owner_id]
+
+            rows = connection.execute(
+                """
+                SELECT documents.document_id, versions.version_id
+                FROM documents
+                JOIN document_versions AS versions ON versions.version_id = documents.current_version_id
+                WHERE documents.owner_id = ?
+                  AND documents.deleted_at IS NULL
+                  AND versions.owner_id = documents.owner_id
+                  AND versions.status = ?
+                  AND versions.is_current = 1
+                  AND versions.retrieval_enabled = 1
+                """
+                + selection_clause
+                + " ORDER BY documents.document_id ASC",
+                [*parameters[:1], DocumentVersionStatus.READY.value, *parameters[1:]],
+            ).fetchall()
+
+        if normalized_ids:
+            ready_ids = {str(row["document_id"]) for row in rows}
+            if ready_ids != set(normalized_ids):
+                raise InvalidStateTransitionError("selected document is not ready for retrieval")
+        return DocumentScope(
+            selection_mode=selection_mode,
+            version_ids=[str(row["version_id"]) for row in rows],
+        )
 
     def _require_active_job(self, connection: sqlite3.Connection, job_id: str) -> dict[str, Any]:
         row = connection.execute(

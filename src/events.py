@@ -20,6 +20,7 @@ class EventType(str, Enum):
     PLAN_CONFIRMED = "plan_confirmed"
     TASK_STARTED = "task_started"
     SEARCHING = "searching"
+    DOCUMENT_RETRIEVAL = "document_retrieval"
     RETRYING = "retrying"
     TASK_COMPLETED = "task_completed"
     TASK_FAILED = "task_failed"
@@ -55,11 +56,20 @@ _CONTENT_KEYS = {
     "content",
     "document",
     "documents",
+    "evidence_excerpt",
+    "excerpt",
+    "image",
+    "images",
     "markdown",
+    "markdown_path",
     "messages",
+    "path",
     "prompt",
     "raw_output",
     "report",
+    "source_path",
+    "text",
+    "vlm_output",
 }
 
 
