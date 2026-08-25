@@ -9,6 +9,7 @@ from src.config import Config, DocumentConfig, DocumentVLMConfig
 
 from .chunking import PreparedImage, chunk_document
 from .conversion import ConvertedDocument, DocumentConversionError, DocumentConversionService, ExtractedImage
+from .index import DocumentIndexError, DocumentIndexService
 from .jobs import IngestionProcessingError
 from .models import DocumentImage, IngestionStage, VisionStatus
 from .repository import DocumentRepository
@@ -31,12 +32,14 @@ class DocumentIngestionPipeline:
         *,
         conversion_service: DocumentConversionService | None = None,
         vision_provider: VisionProvider | None = None,
+        index_service: DocumentIndexService | None = None,
     ):
         self.repository = repository
         self.storage = storage
         self.document_config = document_config
         self.vision_config = vision_config
         self.conversion_service = conversion_service or DocumentConversionService(document_config)
+        self.index_service = index_service
         self.vision_provider_error: VisionProviderError | None = None
         if vision_provider is not None:
             self.vision_provider = vision_provider
@@ -209,13 +212,23 @@ class DocumentIngestionPipeline:
                 images=result.images,
                 vision_status=vision_status,
             )
-            # P2.4 replaces this boundary with Chroma/FTS writes before ``mark_version_ready``.
-            # The explicit stage keeps the future index operation observable without changing the job contract.
+            # The index remains a visible stage before DocumentWorker atomically promotes the version.
             self.repository.update_ingestion_stage(job_id, IngestionStage.INDEXING)
+            if self.index_service is not None:
+                try:
+                    self.index_service.index_job(job_id)
+                except DocumentIndexError as error:
+                    raise IngestionProcessingError("INDEXING_FAILED", "document index creation failed") from error
         except IngestionProcessingError:
             raise
         except Exception as error:
             raise IngestionProcessingError("CHUNKING_FAILED", "document chunking failed") from error
+
+    def on_success(self, job: dict[str, object]) -> None:
+        """Refresh Chroma flags after the repository atomically promotes or archives versions."""
+
+        if self.index_service is not None:
+            self.index_service.sync_document_state(str(job["document_id"]), owner_id=str(job["owner_id"]))
 
 
 def build_document_ingestion_pipeline(config: Config) -> DocumentIngestionPipeline:
@@ -227,4 +240,5 @@ def build_document_ingestion_pipeline(config: Config) -> DocumentIngestionPipeli
         DocumentStorage(config.documents),
         config.documents,
         config.document_vlm,
+        index_service=DocumentIndexService(repository, config.documents, config.embeddings),
     )

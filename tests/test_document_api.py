@@ -9,7 +9,15 @@ from src.documents.storage import DocumentStorage
 from src.repository import SQLiteRepository
 
 
-def _setup(tmp_path):
+class _IndexLifecycleRecorder:
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+
+    def sync_document_state(self, document_id: str, *, owner_id: str):
+        self.calls.append((document_id, owner_id))
+
+
+def _setup(tmp_path, *, document_index=None):
     config = DocumentConfig(storage_root=str(tmp_path / "private"), user_quota_bytes=1_024, max_file_bytes=512)
     core = SQLiteRepository(tmp_path / "research.db")
     document_repository = DocumentRepository(core.database_path, config)
@@ -17,6 +25,7 @@ def _setup(tmp_path):
         repository=core,
         document_repository=document_repository,
         document_storage=DocumentStorage(config),
+        document_index=document_index,
         initialize_services=False,
     )
     return app, core, document_repository, config
@@ -90,4 +99,20 @@ def test_document_api_reports_upload_validation_errors_without_leaking_paths(tmp
             "/documents", files={"file": ("paper.txt", b"text", "text/plain")}, headers=headers
         )
         assert unsupported.status_code == 415
+    core.close()
+
+
+def test_document_delete_and_restore_sync_document_vector_lifecycle(tmp_path):
+    index = _IndexLifecycleRecorder()
+    app, core, _repository, _config = _setup(tmp_path, document_index=index)
+    with TestClient(app) as client:
+        headers = _register(client, "lifecycle-docs")
+        uploaded = client.post(
+            "/documents", files={"file": ("paper.md", b"# Paper", "text/markdown")}, headers=headers
+        ).json()
+        document_id = uploaded["document_id"]
+
+        assert client.delete(f"/documents/{document_id}", headers=headers).status_code == 200
+        assert client.post(f"/documents/{document_id}/restore", headers=headers).status_code == 200
+        assert [call[0] for call in index.calls] == [document_id, document_id]
     core.close()

@@ -45,6 +45,18 @@ class _FailingVision:
         raise VisionProviderError("remote detail must not persist")
 
 
+class _IndexRecorder:
+    def __init__(self):
+        self.indexed: list[str] = []
+        self.synced: list[tuple[str, str]] = []
+
+    def index_job(self, job_id):
+        self.indexed.append(job_id)
+
+    def sync_document_state(self, document_id, *, owner_id):
+        self.synced.append((document_id, owner_id))
+
+
 def _context(tmp_path, *, converted: ConvertedDocument, vlm_config: DocumentVLMConfig, provider=None):
     document_config = DocumentConfig(storage_root=str(tmp_path / "private"), stage_timeout_seconds=10)
     core = SQLiteRepository(tmp_path / "research.db")
@@ -191,5 +203,34 @@ def test_pipeline_adds_non_source_visual_chunk_when_vlm_succeeds(tmp_path):
             connection.close()
         assert version["vision_status"] == "succeeded"
         assert visual_text.startswith("Visual enhancement (non-source):")
+    finally:
+        core.close()
+
+
+def test_pipeline_indexes_before_ready_promotion_and_syncs_vector_lifecycle_afterward(tmp_path):
+    converted = ConvertedDocument(
+        markdown="# Paper\n\n## Methods\n\nIndexed retrieval text.",
+        title="paper",
+        converter_fingerprint="fake-converter",
+    )
+    core, repository, storage, owner_id, document_id, _pipeline = _context(
+        tmp_path, converted=converted, vlm_config=DocumentVLMConfig()
+    )
+    recorder = _IndexRecorder()
+    pipeline = DocumentIngestionPipeline(
+        repository,
+        storage,
+        DocumentConfig(storage_root=str(tmp_path / "private"), stage_timeout_seconds=10),
+        DocumentVLMConfig(),
+        conversion_service=_Converted(converted),
+        index_service=recorder,
+    )
+    try:
+        result = DocumentWorker(repository, pipeline, worker_id="pipeline-worker").run_once()
+        job_id = repository.get_document(document_id, owner_id=owner_id)["jobs"][0]["job_id"]
+
+        assert result.status == "succeeded"
+        assert recorder.indexed == [job_id]
+        assert recorder.synced == [(document_id, owner_id)]
     finally:
         core.close()

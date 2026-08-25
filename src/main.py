@@ -35,6 +35,7 @@ from src.repository import InvalidStateTransitionError, NotFoundError, Repositor
 from src.state import ParseStatus, TaskItem, TaskPlan, TaskStatus, new_id
 from src.tracing import build_trace_callbacks
 from src.documents.models import DocumentDetailView, DocumentListResponse, DocumentVersionView, IngestionJobView, StorageUsageView
+from src.documents.index import DocumentIndexError, DocumentIndexService
 from src.documents.repository import DocumentQuotaExceededError, DocumentRepository
 from src.documents.storage import DocumentStorage, DocumentStorageError, DocumentTooLargeError, UnsupportedDocumentTypeError
 
@@ -240,6 +241,7 @@ def create_app(
     initialize_services: bool = True,
     document_repository: DocumentRepository | None = None,
     document_storage: DocumentStorage | None = None,
+    document_index: DocumentIndexService | None = None,
 ) -> FastAPI:
     """创建 FastAPI 应用"""
     app = FastAPI(title="LangGraph Deep Researcher")
@@ -247,6 +249,7 @@ def create_app(
     app.state.owns_repository = repository is None
     app.state.document_repository = document_repository
     app.state.document_storage = document_storage
+    app.state.document_index = document_index
 
     app.add_middleware(
         CORSMiddleware,
@@ -316,6 +319,14 @@ def create_app(
             storage = DocumentStorage(get_config().documents)
             app.state.document_storage = storage
         return storage
+
+    def active_document_index() -> DocumentIndexService:
+        index = app.state.document_index
+        if index is None:
+            config = get_config()
+            index = DocumentIndexService(active_document_repository(), config.documents, config.embeddings)
+            app.state.document_index = index
+        return index
 
     def document_detail(record: dict[str, Any]) -> DocumentDetailView:
         return DocumentDetailView(
@@ -488,14 +499,26 @@ def create_app(
     @app.delete("/documents/{document_id}", response_model=DocumentDetailView)
     def delete_document(document_id: str, current_user: CurrentUser = Depends(require_current_user)) -> DocumentDetailView:
         try:
-            return document_detail(active_document_repository().delete_document(document_id, owner_id=current_user.user_id))
+            record = active_document_repository().delete_document(document_id, owner_id=current_user.user_id)
+            try:
+                active_document_index().sync_document_state(document_id, owner_id=current_user.user_id)
+            except DocumentIndexError:
+                # SQLite is the authorization source of truth, so a retryable vector update
+                # failure cannot expose a deleted document through retrieval.
+                logger.warning("Document vector soft-delete update failed")
+            return document_detail(record)
         except Exception as error:
             raise document_http_error(error) from error
 
     @app.post("/documents/{document_id}/restore", response_model=DocumentDetailView)
     def restore_document(document_id: str, current_user: CurrentUser = Depends(require_current_user)) -> DocumentDetailView:
         try:
-            return document_detail(active_document_repository().restore_document(document_id, owner_id=current_user.user_id))
+            record = active_document_repository().restore_document(document_id, owner_id=current_user.user_id)
+            try:
+                active_document_index().sync_document_state(document_id, owner_id=current_user.user_id)
+            except DocumentIndexError:
+                logger.warning("Document vector restore update failed")
+            return document_detail(record)
         except Exception as error:
             raise document_http_error(error) from error
 

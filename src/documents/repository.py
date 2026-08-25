@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import re
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,6 +38,24 @@ def _iso_after(seconds: int, *, now: datetime | None = None) -> str:
 
 def _iso_now(now: datetime | None = None) -> str:
     return (now or datetime.now(timezone.utc)).isoformat()
+
+
+_FTS_TERM = re.compile(r"[\u3400-\u9fff]|[A-Za-z0-9_]+")
+
+
+def _fts_index_text(text: str) -> str:
+    """Retain normal FTS tokens and add CJK unigrams for SQLite's built-in tokenizer."""
+
+    cjk_terms = [term for term in _FTS_TERM.findall(text) if len(term) == 1 and "\u3400" <= term <= "\u9fff"]
+    return text if not cjk_terms else f"{text}\n{' '.join(cjk_terms)}"
+
+
+def _fts_query(query: str) -> str:
+    terms = _FTS_TERM.findall(query)
+    if not terms:
+        return ""
+    # Terms are generated locally and quoted, so user input cannot alter FTS5 grammar.
+    return " OR ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
 
 
 class DocumentRepository:
@@ -498,6 +517,297 @@ class DocumentRepository:
                 "UPDATE document_versions SET vision_status = ?, updated_at = ? WHERE version_id = ?",
                 (vision_status.value, now, version_id),
             )
+
+    def indexable_chunks_for_job(self, job_id: str) -> list[dict[str, Any]]:
+        """Return the claimed version's chunks with the metadata required by the isolated vector collection."""
+
+        with self._transaction() as connection:
+            job = self._require_active_job(connection, job_id)
+            rows = connection.execute(
+                """
+                SELECT chunks.chunk_id, chunks.text, chunks.kind, chunks.page_start, chunks.page_end,
+                       parents.parent_id, parents.logical_heading_path, parents.physical_index, parents.locator,
+                       versions.version_id, versions.document_id, versions.owner_id, documents.title
+                FROM document_chunks AS chunks
+                JOIN document_parents AS parents ON parents.parent_id = chunks.parent_id
+                JOIN document_versions AS versions ON versions.version_id = parents.version_id
+                JOIN documents AS documents ON documents.document_id = versions.document_id
+                WHERE versions.version_id = ?
+                ORDER BY parents.physical_index ASC, chunks.rowid ASC
+                """,
+                (job["version_id"],),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_chunk_index_entries(
+        self,
+        job_id: str,
+        *,
+        chroma_ids: dict[str, str],
+        index_fingerprint: str,
+    ) -> None:
+        """Persist the FTS side and vector IDs as one transaction after a successful vector upsert."""
+
+        now = utc_now()
+        with self._transaction(immediate=True) as connection:
+            job = self._require_active_job(connection, job_id)
+            version_id = str(job["version_id"])
+            rows = connection.execute(
+                """
+                SELECT chunks.chunk_id, chunks.text FROM document_chunks AS chunks
+                JOIN document_parents AS parents ON parents.parent_id = chunks.parent_id
+                WHERE parents.version_id = ? ORDER BY parents.physical_index ASC, chunks.rowid ASC
+                """,
+                (version_id,),
+            ).fetchall()
+            expected_ids = {str(row["chunk_id"]) for row in rows}
+            if not expected_ids or expected_ids != set(chroma_ids):
+                raise RepositoryError("index entries must cover exactly the claimed document chunks")
+            connection.execute("DELETE FROM document_chunks_fts WHERE version_id = ?", (version_id,))
+            for row in rows:
+                cursor = connection.execute(
+                    "INSERT INTO document_chunks_fts(chunk_id, version_id, text) VALUES (?, ?, ?)",
+                    (row["chunk_id"], version_id, _fts_index_text(str(row["text"]))),
+                )
+                connection.execute(
+                    "UPDATE document_chunks SET chroma_id = ?, fts_rowid = ? WHERE chunk_id = ?",
+                    (chroma_ids[str(row["chunk_id"])], cursor.lastrowid, row["chunk_id"]),
+                )
+            connection.execute(
+                "UPDATE document_versions SET index_fingerprint = ?, updated_at = ? WHERE version_id = ?",
+                (index_fingerprint[:256], now, version_id),
+            )
+
+    def document_vector_states(self, document_id: str, *, owner_id: str) -> list[dict[str, Any]]:
+        """Return authoritative vector metadata after a lifecycle transition for one owned document."""
+
+        with self._transaction() as connection:
+            self._require_document(connection, document_id, owner_id)
+            rows = connection.execute(
+                """
+                SELECT chunks.chroma_id, chunks.chunk_id, chunks.kind, chunks.page_start, chunks.page_end,
+                       parents.parent_id, versions.version_id, versions.document_id, versions.owner_id,
+                       versions.retrieval_enabled, versions.status, documents.deleted_at
+                FROM document_chunks AS chunks
+                JOIN document_parents AS parents ON parents.parent_id = chunks.parent_id
+                JOIN document_versions AS versions ON versions.version_id = parents.version_id
+                JOIN documents AS documents ON documents.document_id = versions.document_id
+                WHERE versions.document_id = ? AND versions.owner_id = ? AND chunks.chroma_id IS NOT NULL
+                """,
+                (document_id, owner_id),
+            ).fetchall()
+        records = []
+        for row in rows:
+            record = dict(row)
+            record["is_deleted"] = record["deleted_at"] is not None or record["status"] == DocumentVersionStatus.DELETED.value
+            record["retrieval_enabled"] = bool(record["retrieval_enabled"]) and not record["is_deleted"]
+            records.append(record)
+        return records
+
+    @staticmethod
+    def _version_placeholders(version_ids: Sequence[str]) -> str:
+        if not version_ids:
+            raise ValueError("at least one allowed document version is required")
+        return ", ".join("?" for _ in version_ids)
+
+    def _eligible_chunk_rows(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        owner_id: str,
+        version_ids: Sequence[str],
+        chunk_ids: Sequence[str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        version_placeholders = self._version_placeholders(version_ids)
+        clauses = [
+            "versions.owner_id = ?",
+            "versions.version_id IN (" + version_placeholders + ")",
+            "versions.status = ?",
+            "versions.is_current = 1",
+            "versions.retrieval_enabled = 1",
+            "documents.deleted_at IS NULL",
+        ]
+        parameters: list[Any] = [owner_id, *version_ids, DocumentVersionStatus.READY.value]
+        if chunk_ids is not None:
+            if not chunk_ids:
+                return {}
+            clauses.append("chunks.chunk_id IN (" + ", ".join("?" for _ in chunk_ids) + ")")
+            parameters.extend(chunk_ids)
+        rows = connection.execute(
+            """
+            SELECT chunks.chunk_id, chunks.parent_id, chunks.kind, chunks.text, chunks.page_start, chunks.page_end,
+                   chunks.chroma_id, chunks.fts_rowid, parents.logical_heading_path, parents.physical_index,
+                   parents.locator, parents.text AS parent_text, versions.version_id, versions.document_id,
+                   documents.title
+            FROM document_chunks AS chunks
+            JOIN document_parents AS parents ON parents.parent_id = chunks.parent_id
+            JOIN document_versions AS versions ON versions.version_id = parents.version_id
+            JOIN documents AS documents ON documents.document_id = versions.document_id
+            WHERE """
+            + " AND ".join(clauses),
+            parameters,
+        ).fetchall()
+        return {str(row["chunk_id"]): dict(row) for row in rows}
+
+    def eligible_chunks(
+        self, chunk_ids: Sequence[str], *, owner_id: str, version_ids: Sequence[str]
+    ) -> list[dict[str, Any]]:
+        """Re-authorize vector candidates against SQLite before returning their private text."""
+
+        with self._transaction() as connection:
+            records = self._eligible_chunk_rows(
+                connection, owner_id=owner_id, version_ids=version_ids, chunk_ids=chunk_ids
+            )
+        return [records[chunk_id] for chunk_id in chunk_ids if chunk_id in records]
+
+    def bm25_chunks(
+        self,
+        query: str,
+        *,
+        owner_id: str,
+        version_ids: Sequence[str],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Return eligible FTS5 candidates; text is always rejoined to current lifecycle state."""
+
+        fts_query = _fts_query(query)
+        if not fts_query or not version_ids:
+            return []
+        version_placeholders = self._version_placeholders(version_ids)
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT document_chunks_fts.chunk_id, bm25(document_chunks_fts) AS bm25_score
+                FROM document_chunks_fts
+                JOIN document_chunks AS chunks ON chunks.chunk_id = document_chunks_fts.chunk_id
+                JOIN document_parents AS parents ON parents.parent_id = chunks.parent_id
+                JOIN document_versions AS versions ON versions.version_id = parents.version_id
+                JOIN documents AS documents ON documents.document_id = versions.document_id
+                WHERE document_chunks_fts MATCH ?
+                  AND versions.owner_id = ?
+                  AND versions.version_id IN ("""
+                + version_placeholders
+                + """)
+                  AND versions.status = ? AND versions.is_current = 1 AND versions.retrieval_enabled = 1
+                  AND documents.deleted_at IS NULL
+                ORDER BY bm25_score ASC LIMIT ?
+                """,
+                [fts_query, owner_id, *version_ids, DocumentVersionStatus.READY.value, limit],
+            ).fetchall()
+            ids = [str(row["chunk_id"]) for row in rows]
+            records = self._eligible_chunk_rows(connection, owner_id=owner_id, version_ids=version_ids, chunk_ids=ids)
+        scores = {str(row["chunk_id"]): float(row["bm25_score"]) for row in rows}
+        return [dict(records[chunk_id], bm25_score=scores[chunk_id]) for chunk_id in ids if chunk_id in records]
+
+    def retrieval_parents(
+        self, parent_ids: Sequence[str], *, owner_id: str, version_ids: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Load parent text and all children only after repeating owner/version eligibility checks."""
+
+        if not parent_ids or not version_ids:
+            return {}
+        version_placeholders = self._version_placeholders(version_ids)
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT parents.parent_id, parents.text AS parent_text, parents.logical_heading_path,
+                       parents.physical_index, parents.locator, versions.version_id, versions.document_id,
+                       documents.title, chunks.chunk_id, chunks.kind, chunks.text, chunks.page_start, chunks.page_end
+                FROM document_parents AS parents
+                JOIN document_versions AS versions ON versions.version_id = parents.version_id
+                JOIN documents AS documents ON documents.document_id = versions.document_id
+                LEFT JOIN document_chunks AS chunks ON chunks.parent_id = parents.parent_id
+                WHERE parents.parent_id IN ("""
+                + ", ".join("?" for _ in parent_ids)
+                + """)
+                  AND versions.owner_id = ? AND versions.version_id IN ("""
+                + version_placeholders
+                + """)
+                  AND versions.status = ? AND versions.is_current = 1 AND versions.retrieval_enabled = 1
+                  AND documents.deleted_at IS NULL
+                ORDER BY parents.physical_index ASC, chunks.rowid ASC
+                """,
+                [*parent_ids, owner_id, *version_ids, DocumentVersionStatus.READY.value],
+            ).fetchall()
+        parents: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            data = dict(row)
+            parent = parents.setdefault(
+                str(data["parent_id"]),
+                {
+                    key: data[key]
+                    for key in (
+                        "parent_id",
+                        "parent_text",
+                        "logical_heading_path",
+                        "physical_index",
+                        "locator",
+                        "version_id",
+                        "document_id",
+                        "title",
+                    )
+                }
+                | {"chunks": []},
+            )
+            if data["chunk_id"] is not None:
+                parent["chunks"].append(
+                    {
+                        key: data[key]
+                        for key in ("chunk_id", "kind", "text", "page_start", "page_end")
+                    }
+                )
+        return parents
+
+    def expired_deleted_documents(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
+        """List candidates for a caller-owned physical cleanup pass without deleting anything."""
+
+        cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=self.config.purge_retention_days)
+        with self._transaction() as connection:
+            documents = connection.execute(
+                "SELECT document_id, owner_id FROM documents WHERE deleted_at IS NOT NULL AND deleted_at < ?",
+                (cutoff.isoformat(),),
+            ).fetchall()
+            candidates = []
+            for document in documents:
+                versions = connection.execute(
+                    "SELECT version_id, source_path FROM document_versions WHERE document_id = ?",
+                    (document["document_id"],),
+                ).fetchall()
+                chroma_rows = connection.execute(
+                    """
+                    SELECT chunks.chroma_id FROM document_chunks AS chunks
+                    JOIN document_parents AS parents ON parents.parent_id = chunks.parent_id
+                    WHERE parents.version_id IN (SELECT version_id FROM document_versions WHERE document_id = ?)
+                      AND chunks.chroma_id IS NOT NULL
+                    """,
+                    (document["document_id"],),
+                ).fetchall()
+                candidates.append(
+                    {
+                        "document_id": document["document_id"],
+                        "owner_id": document["owner_id"],
+                        "version_ids": [str(version["version_id"]) for version in versions],
+                        "chroma_ids": [str(row["chroma_id"]) for row in chroma_rows],
+                    }
+                )
+        return candidates
+
+    def purge_deleted_document(self, document_id: str, *, owner_id: str, now: datetime | None = None) -> list[str]:
+        """Purge one still-expired logical document and return its version IDs for private file cleanup."""
+
+        cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=self.config.purge_retention_days)
+        with self._transaction(immediate=True) as connection:
+            document = self._require_document(connection, document_id, owner_id)
+            if document["deleted_at"] is None or document["deleted_at"] >= cutoff.isoformat():
+                return []
+            rows = connection.execute(
+                "SELECT version_id FROM document_versions WHERE document_id = ?", (document_id,)
+            ).fetchall()
+            version_ids = [str(row["version_id"]) for row in rows]
+            for version_id in version_ids:
+                connection.execute("DELETE FROM document_chunks_fts WHERE version_id = ?", (version_id,))
+            connection.execute("DELETE FROM documents WHERE document_id = ? AND owner_id = ?", (document_id, owner_id))
+        return version_ids
 
     def mark_version_ready(self, document_id: str, version_id: str, *, owner_id: str) -> dict[str, Any]:
         """Atomically promote a successfully indexed version and archive the prior current version."""

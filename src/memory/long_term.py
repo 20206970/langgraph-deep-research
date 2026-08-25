@@ -53,11 +53,9 @@ def _resolve_embedding_device(device: str) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _get_embeddings_model() -> Embeddings:
-    """Create the configured embeddings model without silently changing providers."""
-    from src.config import get_config
+def create_embeddings(emb_config) -> Embeddings:
+    """Create one configured embedding adapter for an isolated vector collection."""
 
-    emb_config = get_config().embeddings
     provider = emb_config.provider.lower().strip()
     if provider == "huggingface":
         from langchain_huggingface import HuggingFaceEmbeddings
@@ -90,6 +88,13 @@ def _get_embeddings_model() -> Embeddings:
             base_url=emb_config.base_url or None,
         )
     raise ValueError(f"Unsupported embeddings provider: {emb_config.provider}")
+
+
+def _get_embeddings_model() -> Embeddings:
+    """Create the configured memory embedding model without silently changing providers."""
+    from src.config import get_config
+
+    return create_embeddings(get_config().embeddings)
 
 
 def create_long_term_memory(

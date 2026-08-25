@@ -64,6 +64,14 @@ class DocumentWorker:
                 status="failed",
                 error_code=getattr(error, "error_code", "INGESTION_HANDLER_FAILED"),
             )
+        completion_hook = getattr(self.handler, "on_success", None)
+        if callable(completion_hook):
+            try:
+                completion_hook(job)
+            except Exception:
+                # The version is already transactionally ready. SQLite eligibility checks make
+                # a stale vector lifecycle flag a recall issue, never an authorization bypass.
+                return JobRunResult(job_id=str(job["job_id"]), status="succeeded", error_code="INDEX_STATE_SYNC_DEGRADED")
         return JobRunResult(job_id=str(job["job_id"]), status="succeeded")
 
     def run_forever(self, *, poll_seconds: float = 1.0, should_stop: Callable[[], bool] | None = None) -> None:
