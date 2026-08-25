@@ -132,6 +132,13 @@ class ChromaDocumentVectorStore:
         except Exception as error:
             raise DocumentIndexError("Chroma vector deletion failed") from error
 
+    def close(self) -> None:
+        """Release the persistent Chroma client so temporary stores can be removed on Windows."""
+
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            close()
+
 
 class DocumentIndexService:
     """Coordinates vector writes with SQLite FTS/mapping writes and lifecycle metadata updates."""
