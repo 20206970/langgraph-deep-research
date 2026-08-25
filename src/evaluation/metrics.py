@@ -78,12 +78,24 @@ def _task_metrics(task_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     latency_values = [result.get("latency_ms") for result in results if isinstance(result.get("latency_ms"), int)]
     token_totals: Counter[str] = Counter()
     token_available_task_count = 0
+    cache_hit_task_count = 0
+    estimated_costs: list[float] = []
+    unavailable_cost_task_count = 0
+    budget_statuses: Counter[str] = Counter()
     for result in results:
         token_usage = _as_dict(result.get("token_usage"))
         numeric_usage = {key: value for key, value in token_usage.items() if isinstance(value, int) and value >= 0}
         if numeric_usage:
             token_available_task_count += 1
             token_totals.update(numeric_usage)
+        if result.get("cache_hit") is True:
+            cache_hit_task_count += 1
+        cost = result.get("estimated_cost")
+        if result.get("cost_status") == "estimated" and isinstance(cost, (int, float)):
+            estimated_costs.append(float(cost))
+        else:
+            unavailable_cost_task_count += 1
+        budget_statuses[str(result.get("budget_status") or "unknown")] += 1
     total = len(results)
     return {
         "total_count": total,
@@ -103,6 +115,16 @@ def _task_metrics(task_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
             "available_task_count": token_available_task_count,
             "total": dict(sorted(token_totals.items())) if token_available_task_count else None,
         },
+        "cache": {
+            "cache_hit_task_count": cache_hit_task_count,
+            "cache_hit_rate": cache_hit_task_count / total if total else None,
+        },
+        "estimated_cost": {
+            "available_task_count": len(estimated_costs),
+            "unavailable_task_count": unavailable_cost_task_count,
+            "total": round(sum(estimated_costs), 12) if estimated_costs and not unavailable_cost_task_count else None,
+        },
+        "budget_statuses": dict(sorted(budget_statuses.items())),
     }
 
 
@@ -237,6 +259,12 @@ def aggregate_case_runs(case_runs: list[dict[str, Any]]) -> dict[str, Any]:
     facet_values = [metric["planner"]["facet_coverage_proxy"] for metric in metrics if metric["planner"]["facet_coverage_proxy"] is not None]
     citation_values = [metric["citation"]["summary"]["citation_coverage"] for metric in metrics]
     source_violation_count = sum(metric["sources"]["source_scope_violation_count"] for metric in metrics)
+    cache_hit_task_count = sum(metric["tasks"]["cache"]["cache_hit_task_count"] for metric in metrics)
+    estimated_cost_values = [
+        metric["tasks"]["estimated_cost"]["total"]
+        for metric in metrics
+        if metric["tasks"]["estimated_cost"]["total"] is not None
+    ]
     return {
         "case_run_count": total,
         "succeeded_case_run_count": len(successful),
@@ -248,4 +276,7 @@ def aggregate_case_runs(case_runs: list[dict[str, Any]]) -> dict[str, Any]:
         "facet_coverage_proxy": _summary_stats(facet_values),
         "citation_coverage": _summary_stats(citation_values),
         "source_scope_violation_count": source_violation_count,
+        "cache_hit_task_count": cache_hit_task_count,
+        "cache_hit_rate": cache_hit_task_count / total_tasks if total_tasks else None,
+        "estimated_cost": _summary_stats(estimated_cost_values),
     }

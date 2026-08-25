@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--offline", action="store_true", help="使用数据集快照替代所有在线检索")
     parser.add_argument("--runs", type=int, default=3, help="离线评测每个 case 的重复运行次数，默认 3")
     parser.add_argument("--model-label", default="unspecified", help="记录到离线产物中的模型标签")
+    parser.add_argument("--route-label", default="default", help="记录到离线产物中的模型路由标签")
     parser.add_argument("--prompt-version", default="p0.2", help="记录到离线产物中的 Prompt 版本")
     parser.add_argument("--output-dir", type=Path, help="离线评测产物目录；非空目录会拒绝覆盖")
 
@@ -34,6 +35,7 @@ def main():
                 args.dataset,
                 runs=args.runs,
                 model_label=args.model_label,
+                route_label=args.route_label,
                 prompt_version=args.prompt_version,
             ).run(args.output_dir)
         except (ValueError, FileExistsError) as error:

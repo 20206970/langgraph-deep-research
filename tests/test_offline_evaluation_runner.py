@@ -71,6 +71,7 @@ def test_offline_runner_writes_traceable_multi_run_artifacts_and_preserves_graph
         dataset,
         runs=2,
         model_label="fake-model",
+        route_label="fake-route",
         prompt_version="test-prompt",
         graph_factory=lambda: FakeSnapshotGraph("src_allowed", inspect_fixture=True),
     )
@@ -84,6 +85,9 @@ def test_offline_runner_writes_traceable_multi_run_artifacts_and_preserves_graph
     assert (output_dir / "summary.md").is_file()
     assert result["results"]["aggregate"]["case_run_count"] == 2
     assert result["results"]["aggregate"]["failed_case_run_count"] == 0
+    assert result["config"]["route_label"] == "fake-route"
+    assert result["config"]["routing"]["label"] == "fake-route"
+    assert all(record["routing"]["label"] == "fake-route" for record in result["results"]["case_runs"])
     assert all(record["metrics"]["sources"]["source_scope_violation_count"] == 0 for record in result["results"]["case_runs"])
     assert all(record["fixture"]["call_count"] == 1 for record in result["results"]["case_runs"])
     assert "结构化引用覆盖率中位数" in (output_dir / "summary.md").read_text(encoding="utf-8")

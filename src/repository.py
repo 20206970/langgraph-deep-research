@@ -11,7 +11,7 @@ from typing import Any, Iterator
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from src.events import EventType, ResearchEvent
-from src.state import ResearchRun, RunStatus, TaskPlan, TaskStatus, utc_now
+from src.state import ResearchRun, RunBudget, RunStatus, TaskPlan, TaskStatus, utc_now
 
 
 class RepositoryError(RuntimeError):
@@ -243,7 +243,13 @@ class SQLiteRepository:
             self._event(connection, "plan_cancelled", {"plan_id": plan_id, "plan_version": plan_version})
         return self.get_plan(plan_id, plan_version)
 
-    def create_run(self, plan_id: str, plan_version: int) -> dict[str, Any]:
+    def create_run(
+        self,
+        plan_id: str,
+        plan_version: int,
+        *,
+        budget: RunBudget | None = None,
+    ) -> dict[str, Any]:
         plan_record = self.get_plan(plan_id, plan_version)
         if plan_record["status"] != RunStatus.CONFIRMED.value:
             raise InvalidStateTransitionError("runs require a confirmed plan version")
@@ -253,6 +259,7 @@ class SQLiteRepository:
             plan_version=plan.plan_version,
             topic=plan.topic,
             status=RunStatus.CONFIRMED,
+            budget=budget or RunBudget(),
         )
         payload = run.model_dump(mode="json")
         with self._connection() as connection:

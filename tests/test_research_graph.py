@@ -7,10 +7,11 @@ from src.state import ResearchRun, RunStatus, TaskItem, TaskPlan
 
 
 class FakeMessage:
-    def __init__(self, content: str, message_type: str = "ai", name: str = ""):
+    def __init__(self, content: str, message_type: str = "ai", name: str = "", usage_metadata=None):
         self.content = content
         self.type = message_type
         self.name = name
+        self.usage_metadata = usage_metadata
 
 
 class FakePlanner:
@@ -86,6 +87,13 @@ class FakeReporter:
         return {"messages": [FakeMessage("# Final report\n\nStructured report.")]}
 
 
+class UsageSummarizer(FakeSummarizer):
+    def invoke(self, payload):
+        response = super().invoke(payload)
+        response["messages"][-1].usage_metadata = {"input_tokens": 2, "output_tokens": 1}
+        return response
+
+
 class FakeLlm:
     def __init__(self, repair_output: str = "not json"):
         self.repair_output = repair_output
@@ -112,7 +120,7 @@ def test_graph_aggregates_parallel_results_by_task_id_and_plan_order(monkeypatch
     )
     reporter = FakeReporter()
     _disable_memory(monkeypatch)
-    monkeypatch.setattr(research, "_create_llm", lambda: FakeLlm())
+    monkeypatch.setattr(research, "_create_llm", lambda *_args, **_kwargs: FakeLlm())
     monkeypatch.setattr(research, "create_planner_agent", lambda _llm: FakePlanner(planner_output))
     monkeypatch.setattr(research, "create_summarizer_agent", lambda _llm: FakeSummarizer())
     monkeypatch.setattr(research, "create_reporter_agent", lambda _llm: reporter)
@@ -134,7 +142,7 @@ def test_invalid_planner_output_does_not_dispatch_search(monkeypatch):
     llm = FakeLlm("still invalid")
     dispatched = {"summarizer": 0}
     _disable_memory(monkeypatch)
-    monkeypatch.setattr(research, "_create_llm", lambda: llm)
+    monkeypatch.setattr(research, "_create_llm", lambda *_args, **_kwargs: llm)
     monkeypatch.setattr(research, "create_planner_agent", lambda _llm: FakePlanner("not json"))
 
     def unexpected_summarizer(_llm):
@@ -165,7 +173,7 @@ def test_confirmed_plan_executes_without_calling_planner(monkeypatch):
     )
     reporter = FakeReporter()
     _disable_memory(monkeypatch)
-    monkeypatch.setattr(research, "_create_llm", lambda: FakeLlm())
+    monkeypatch.setattr(research, "_create_llm", lambda *_args, **_kwargs: FakeLlm())
     monkeypatch.setattr(
         research,
         "create_planner_agent",
@@ -207,7 +215,7 @@ def test_graph_publishes_task_and_run_events(monkeypatch, tmp_path):
     register_publisher(publisher)
     reporter = FakeReporter()
     _disable_memory(monkeypatch)
-    monkeypatch.setattr(research, "_create_llm", lambda: FakeLlm())
+    monkeypatch.setattr(research, "_create_llm", lambda *_args, **_kwargs: FakeLlm())
     monkeypatch.setattr(research, "create_planner_agent", lambda _llm: AssertionError("Planner must be skipped"))
     monkeypatch.setattr(research, "create_summarizer_agent", lambda _llm: FakeSummarizer())
     monkeypatch.setattr(research, "create_reporter_agent", lambda _llm: reporter)
@@ -240,7 +248,7 @@ def test_graph_publishes_task_and_run_events(monkeypatch, tmp_path):
 def test_reporter_uses_plan_order_when_result_map_is_reverse_order(monkeypatch):
     reporter = FakeReporter()
     _disable_memory(monkeypatch)
-    monkeypatch.setattr(research, "_create_llm", lambda: FakeLlm())
+    monkeypatch.setattr(research, "_create_llm", lambda *_args, **_kwargs: FakeLlm())
     monkeypatch.setattr(research, "create_reporter_agent", lambda _llm: reporter)
 
     state = {
@@ -267,3 +275,81 @@ def test_reporter_uses_plan_order_when_result_map_is_reverse_order(monkeypatch):
 
     prompt = reporter.prompts[0]
     assert prompt.index("任务结果：first summary") < prompt.index("任务结果：second summary")
+
+
+def test_graph_marks_run_failed_and_report_scoped_when_token_budget_is_reached(monkeypatch):
+    plan = TaskPlan(
+        topic="budget topic",
+        tasks=[TaskItem(id=1, title="First", intent="first intent", query="first query")],
+    )
+    run = ResearchRun(
+        plan_id=plan.plan_id,
+        plan_version=plan.plan_version,
+        topic=plan.topic,
+        status=RunStatus.CONFIRMED,
+        budget={"max_total_tokens": 1},
+    )
+    reporter = FakeReporter()
+    _disable_memory(monkeypatch)
+    monkeypatch.setattr(research, "_create_llm", lambda *_args, **_kwargs: FakeLlm())
+    monkeypatch.setattr(research, "create_summarizer_agent", lambda _llm: UsageSummarizer())
+    monkeypatch.setattr(research, "create_reporter_agent", lambda _llm: reporter)
+
+    result = research.create_research_graph().invoke(
+        {
+            "topic": plan.topic,
+            "confirmed_plan": True,
+            "plan": plan.model_dump(mode="json"),
+            "run": run.model_dump(mode="json"),
+            "task_results": {},
+            "sources": {},
+            "task_source_refs": {},
+        }
+    )
+
+    task_result = next(iter(result["task_results"].values()))
+    assert task_result["status"] == "succeeded"
+    assert task_result["budget_status"] == "exhausted"
+    assert result["run"]["status"] == RunStatus.FAILED.value
+    assert result["run"]["budget_usage"]["exceeded_reason"] == "MAX_TOTAL_TOKENS"
+    assert "## 执行范围限制" in result["report"]
+
+
+def test_graph_does_not_dispatch_tasks_beyond_strict_max_tasks_budget(monkeypatch):
+    plan = TaskPlan(
+        topic="task limit topic",
+        tasks=[
+            TaskItem(id=1, title="First", intent="first intent", query="first query"),
+            TaskItem(id=2, title="Second", intent="second intent", query="second query"),
+        ],
+    )
+    run = ResearchRun(
+        plan_id=plan.plan_id,
+        plan_version=plan.plan_version,
+        topic=plan.topic,
+        status=RunStatus.CONFIRMED,
+        budget={"max_tasks": 1},
+    )
+    reporter = FakeReporter()
+    _disable_memory(monkeypatch)
+    monkeypatch.setattr(research, "_create_llm", lambda *_args, **_kwargs: FakeLlm())
+    monkeypatch.setattr(research, "create_summarizer_agent", lambda _llm: FakeSummarizer())
+    monkeypatch.setattr(research, "create_reporter_agent", lambda _llm: reporter)
+
+    result = research.create_research_graph().invoke(
+        {
+            "topic": plan.topic,
+            "confirmed_plan": True,
+            "plan": plan.model_dump(mode="json"),
+            "run": run.model_dump(mode="json"),
+            "task_results": {},
+            "sources": {},
+            "task_source_refs": {},
+        }
+    )
+
+    first, second = plan.tasks
+    assert result["task_results"][first.task_id]["status"] == "succeeded"
+    assert result["task_results"][second.task_id]["error_code"] == "BUDGET_EXCEEDED"
+    assert result["run"]["status"] == RunStatus.FAILED.value
+    assert "Second" in result["report"]

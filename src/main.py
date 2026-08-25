@@ -14,6 +14,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from src.config import get_config
+from src.budget import budget_from_config
 from src.graph.research import _safe_error_message, create_research_graph, get_research_graph
 from src.memory.long_term import create_long_term_memory, search_long_term_memory
 from src.memory.short_term import create_short_term_memory, get_short_term_memory
@@ -197,13 +198,22 @@ def _trace_metadata(run: dict[str, Any], *, session_id: str | None = None) -> di
     """Build low-cardinality metadata safe to send to an optional tracer."""
     model_versions = run.get("model_versions") or {}
     prompt_versions = run.get("prompt_versions") or {}
-    return {
+    budget = run.get("budget") or {}
+    metadata = {
         "run_id": str(run.get("run_id") or ""),
         "session_id": str(session_id or ""),
-        "model_version": str(model_versions.get("default") or ""),
+        "model_version": str(model_versions.get("summarizer") or model_versions.get("default") or ""),
         "prompt_version": str(prompt_versions.get("reporter") or ""),
+        "budget_max_tasks": str(budget.get("max_tasks") or ""),
+        "budget_max_search_attempts": str(budget.get("max_search_attempts") or ""),
+        "budget_token_limit_enabled": str(budget.get("max_total_tokens") is not None).lower(),
+        "budget_cost_limit_enabled": str(budget.get("max_estimated_cost") is not None).lower(),
         "redacted": "true",
     }
+    for role in ("router", "planner", "summarizer", "reporter", "repair", "judge"):
+        if model_versions.get(role):
+            metadata[f"model_{role}"] = str(model_versions[role])
+    return metadata
 
 
 def _execute_persisted_run(
@@ -361,7 +371,11 @@ def create_app(
     def create_persisted_run(payload: RunCreateRequest) -> dict[str, Any]:
         try:
             repository_instance = active_repository()
-            run = repository_instance.create_run(payload.plan_id, payload.plan_version)
+            run = repository_instance.create_run(
+                payload.plan_id,
+                payload.plan_version,
+                budget=budget_from_config(get_config()),
+            )
             return _execute_persisted_run(repository_instance, graph_factory, run["run"]["run_id"])
         except RepositoryError as error:
             raise _repository_http_error(error) from error
@@ -412,7 +426,11 @@ def create_app(
             repository_instance = active_repository()
             plan = repository_instance.create_plan(_generate_valid_plan(payload.topic))
             repository_instance.confirm_plan(plan["plan"]["plan_id"], plan["plan"]["plan_version"])
-            created_run = repository_instance.create_run(plan["plan"]["plan_id"], plan["plan"]["plan_version"])
+            created_run = repository_instance.create_run(
+                plan["plan"]["plan_id"],
+                plan["plan"]["plan_version"],
+                budget=budget_from_config(get_config()),
+            )
             result = _execute_persisted_run(repository_instance, graph_factory, created_run["run"]["run_id"])
         except Exception as exc:
             logger.exception("Research failed")
@@ -474,7 +492,9 @@ def create_app(
                     plan["plan"]["plan_id"], plan["plan"]["plan_version"]
                 )
                 created = repository_instance.create_run(
-                    confirmed["plan"]["plan_id"], confirmed["plan"]["plan_version"]
+                    confirmed["plan"]["plan_id"],
+                    confirmed["plan"]["plan_version"],
+                    budget=budget_from_config(get_config()),
                 )
                 run_id = created["run"]["run_id"]
                 publisher = EventPublisher(repository_instance, run_id)
@@ -604,6 +624,7 @@ def create_app(
         # Create LLM
         from src.llm import create_llm
         llm = create_llm()
+        router_llm = create_llm("router")
 
         # Route intent
         try:
@@ -611,7 +632,7 @@ def create_app(
                 message=user_msg,
                 has_report=session.last_report is not None,
                 has_tasks=session.last_tasks is not None,
-                llm=llm,
+                llm=router_llm,
             )
         except Exception:
             intent = "new_research"

@@ -41,6 +41,27 @@ cp .env.example .env
 - `LANGSMITH_CAPTURE_CONTENT=false` 保持输入输出隐藏；Trace metadata 只包含运行标识、模型/Prompt 版本和脱敏标记。
 - LangSmith 未配置或不可达时自动降级，不影响本地事件和研究流程。
 
+P1.3 模型路由、缓存与预算：
+
+- 每个角色默认回退到 `OPENAI_MODEL`；只在需要时设置 `ROUTER_MODEL`、`PLANNER_MODEL`、`SUMMARIZER_MODEL`、`REPORTER_MODEL`、`REPAIR_MODEL` 或 `JUDGE_MODEL`。
+- 可选的 `*_TEMPERATURE` 和 `*_MAX_TOKENS` 仅影响对应角色。`MODEL_PRICING_JSON` 未提供时只记录 Token，成本状态为 `unavailable`，不会猜测价格。
+- `SEARCH_CACHE_ENABLED=true` 使用 `RESEARCH_DB_PATH` 中的 SQLite TTL 缓存；缓存命中会保留来源快照并在任务和 SSE 事件中标记 `cache_hit=true`。离线评测快照不会进入此缓存。
+- 新运行会固化 `RUN_MAX_TASKS=5`、`RUN_MAX_SEARCH_ATTEMPTS=3`、`RUN_MAX_FORMAT_REPAIRS=1` 与 `RUN_MAX_ELAPSED_SECONDS=300`。`RUN_MAX_TOTAL_TOKENS` 和 `RUN_MAX_ESTIMATED_COST` 留空时禁用；已并行启动任务的总量限制是协作式的，报告会明确标注受预算影响的范围。
+
+离线路由对比示例：
+
+```bash
+python -m src.evaluation.cli --offline --dataset evaluation_data/v1-draft \
+  --runs 3 --route-label baseline --model-label OPENAI_MODEL --output-dir evaluation_results/baseline
+
+# 仅通过环境变量覆盖需要比较的角色模型，再写入独立目录。
+SUMMARIZER_MODEL=your-research-model python -m src.evaluation.cli --offline \
+  --dataset evaluation_data/v1-draft --runs 3 --route-label candidate \
+  --model-label candidate --output-dir evaluation_results/candidate
+```
+
+每个产物目录的 `config.json`、`results.json` 与 `summary.md` 分别保存路由指纹、任务级 Token/缓存/成本指标和聚合质量、延迟、失败率指标；非空输出目录会拒绝覆盖。
+
 ### 3. 运行服务
 
 ```bash

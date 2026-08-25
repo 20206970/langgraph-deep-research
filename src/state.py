@@ -10,7 +10,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -45,6 +45,28 @@ class ParseStatus(str, Enum):
     VALID = "valid"
     REPAIRED = "repaired"
     REJECTED = "rejected"
+
+
+class RunBudget(BaseModel):
+    """Persisted per-run limits; ``None`` disables aggregate token/cost caps."""
+
+    max_tasks: int = Field(default=5, ge=1, le=7)
+    max_search_attempts: int = Field(default=3, ge=1, le=10)
+    max_format_repairs: int = Field(default=1, ge=0, le=3)
+    max_total_tokens: Optional[int] = Field(default=None, ge=1)
+    max_estimated_cost: Optional[float] = Field(default=None, gt=0.0)
+    max_elapsed_seconds: int = Field(default=300, ge=1)
+
+
+class BudgetUsage(BaseModel):
+    """Observed run usage; costs remain unavailable until usage and pricing exist."""
+
+    total_tokens: int = Field(default=0, ge=0)
+    estimated_cost: Optional[float] = Field(default=None, ge=0.0)
+    cost_status: str = Field(default="unavailable", max_length=32)
+    elapsed_seconds: float = Field(default=0.0, ge=0.0)
+    exhausted: bool = False
+    exceeded_reason: Optional[str] = Field(default=None, max_length=100)
 
 
 class TaskItem(BaseModel):
@@ -120,6 +142,8 @@ class ResearchRun(BaseModel):
     status: RunStatus = RunStatus.PLANNED
     model_versions: dict[str, str] = Field(default_factory=dict)
     prompt_versions: dict[str, str] = Field(default_factory=dict)
+    budget: RunBudget = Field(default_factory=RunBudget)
+    budget_usage: BudgetUsage = Field(default_factory=BudgetUsage)
     output_diagnostics: dict[str, dict[str, Any]] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
@@ -179,6 +203,10 @@ class TaskResult(BaseModel):
     error_message: Optional[str] = Field(default=None, max_length=1_000)
     latency_ms: Optional[int] = Field(default=None, ge=0)
     token_usage: dict[str, int] = Field(default_factory=dict)
+    estimated_cost: Optional[float] = Field(default=None, ge=0.0)
+    cost_status: str = Field(default="unavailable", max_length=32)
+    cache_hit: bool = False
+    budget_status: str = Field(default="within_budget", max_length=32)
     parse_status: ParseStatus = ParseStatus.VALID
 
     @model_validator(mode="after")

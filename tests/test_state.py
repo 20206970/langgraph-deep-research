@@ -3,6 +3,7 @@ import json
 import pytest
 
 from src.state import (
+    SCHEMA_VERSION,
     ParseStatus,
     SourceItem,
     TaskItem,
@@ -22,7 +23,7 @@ def test_task_plan_json_round_trip_preserves_stable_task_ids():
 
     restored = TaskPlan.model_validate_json(json.dumps(plan.model_dump(mode="json")))
 
-    assert restored.schema_version == 1
+    assert restored.schema_version == SCHEMA_VERSION
     assert restored.tasks[0].task_id == plan.tasks[0].task_id
     assert restored.tasks[0].query_history == ["LangGraph architecture"]
 

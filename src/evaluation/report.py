@@ -19,13 +19,14 @@ def render_summary_markdown(config: dict[str, Any], aggregate: dict[str, Any]) -
     elapsed = aggregate["total_elapsed_ms"]
     facet = aggregate["facet_coverage_proxy"]
     citation = aggregate["citation_coverage"]
+    estimated_cost = aggregate["estimated_cost"]
     failure_count = dataset["manifest"].get("failure_count", 0)
     return "\n".join(
         [
             "# v1 快照离线评测汇总",
             "",
             f"- 数据集：`{dataset['manifest']['dataset_id']}`（{dataset['manifest'].get('status', 'unknown')}）",
-            f"- 模型标签：`{config['model_label']}`；Prompt 版本：`{config['prompt_version']}`",
+            f"- 路由标签：`{config['route_label']}`；模型标签：`{config['model_label']}`；Prompt 版本：`{config['prompt_version']}`",
             f"- 重复次数：{config['runs']}；离线快照模式：`{config['offline']}`",
             f"- 原始逐 case/run 记录见 `results.json`；本文件全部数值均由其 aggregate 字段生成。",
             "",
@@ -41,6 +42,8 @@ def render_summary_markdown(config: dict[str, Any], aggregate: dict[str, Any]) -
             f"| 维度覆盖 proxy 中位数 | {_value(facet['median'])} |",
             f"| 结构化引用覆盖率中位数 | {_value(citation['median'])} |",
             f"| 来源范围违规数 | {_value(aggregate['source_scope_violation_count'])} |",
+            f"| 缓存命中任务数 / 命中率 | {_value(aggregate['cache_hit_task_count'])} / {_value(aggregate['cache_hit_rate'])} |",
+            f"| 已知估算成本中位数 | {_value(estimated_cost['median'])} |",
             "",
             "## 口径与限制",
             "",

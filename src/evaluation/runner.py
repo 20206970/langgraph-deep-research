@@ -21,6 +21,9 @@ from src.evaluation.dataset import EvaluationDataset, load_evaluation_dataset
 from src.evaluation.fixtures import OfflineSnapshotFixture
 from src.evaluation.metrics import aggregate_case_runs, compute_case_metrics
 from src.evaluation.report import render_summary_markdown
+from src.budget import budget_from_config
+from src.config import get_config
+from src.llm import model_versions
 
 
 @dataclass
@@ -322,7 +325,7 @@ class EvaluationRunner:
 class OfflineEvaluationRunner:
     """Run the production graph against immutable evidence snapshots only."""
 
-    RUNNER_VERSION = "p0.3-v1"
+    RUNNER_VERSION = "p1.3-v1"
     _ARTIFACT_KEYS = (
         "run",
         "plan",
@@ -341,6 +344,7 @@ class OfflineEvaluationRunner:
         *,
         runs: int = 3,
         model_label: str = "unspecified",
+        route_label: str = "default",
         prompt_version: str = "p0.2",
         graph_factory: Callable[[], Any] | None = None,
     ):
@@ -349,6 +353,7 @@ class OfflineEvaluationRunner:
         self.dataset = load_evaluation_dataset(dataset) if isinstance(dataset, Path) else dataset
         self.runs = runs
         self.model_label = model_label.strip() or "unspecified"
+        self.route_label = route_label.strip() or "default"
         self.prompt_version = prompt_version.strip() or "unspecified"
         self.graph_factory = graph_factory or research.create_research_graph
 
@@ -391,6 +396,7 @@ class OfflineEvaluationRunner:
             (
                 timestamp,
                 self._slug(self.dataset.dataset_id),
+                self._slug(self.route_label),
                 self._slug(self.model_label),
                 self._slug(self.prompt_version),
             )
@@ -406,12 +412,14 @@ class OfflineEvaluationRunner:
         return output_dir
 
     def _config(self, started_at: str, output_dir: Path) -> dict[str, Any]:
+        config = get_config()
         return {
             "schema_version": "1",
             "started_at": started_at,
             "offline": True,
             "runs": self.runs,
             "model_label": self.model_label,
+            "route_label": self.route_label,
             "prompt_version": self.prompt_version,
             "output_dir": str(output_dir),
             "dataset": {
@@ -423,6 +431,18 @@ class OfflineEvaluationRunner:
                 "version": self.RUNNER_VERSION,
                 "source_fixture": OfflineSnapshotFixture.fixture_version,
                 "source_policy": "case-scoped immutable snapshots only",
+            },
+            "routing": {
+                "label": self.route_label,
+                "model_versions": model_versions(),
+            },
+            "budget": budget_from_config(config).model_dump(mode="json"),
+            "search_cache": {
+                "enabled": config.search_cache.enabled,
+                "ttl_seconds": config.search_cache.ttl_seconds,
+                "language": config.search_cache.language,
+                "tool_version": config.search_cache.tool_version,
+                "offline_fixture_bypasses_live_cache": True,
             },
             "git_revision": self._git_revision(),
         }
@@ -473,6 +493,8 @@ class OfflineEvaluationRunner:
             elapsed_ms,
         )
         graph_run_status = str(graph_result.get("run", {}).get("status") or "failed")
+        run_artifact = graph_result.get("run", {})
+        configured_budget = budget_from_config(get_config()).model_dump(mode="json")
         source_scope_clean = metrics["sources"]["source_scope_violation_count"] == 0
         status = "succeeded" if graph_run_status == "succeeded" and source_scope_clean and not runner_error else "failed"
         artifacts = {key: graph_result.get(key) for key in self._ARTIFACT_KEYS if key in graph_result}
@@ -482,6 +504,14 @@ class OfflineEvaluationRunner:
             "run_index": run_index,
             "status": status,
             "graph_run_status": graph_run_status,
+            "routing": {
+                "label": self.route_label,
+                "model_versions": run_artifact.get("model_versions") or model_versions(),
+            },
+            "budget": {
+                "configured": run_artifact.get("budget") or configured_budget,
+                "usage": run_artifact.get("budget_usage") or {},
+            },
             "runner_error": runner_error,
             "fixture": fixture_audit,
             "artifacts": artifacts,

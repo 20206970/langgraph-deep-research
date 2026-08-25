@@ -12,13 +12,17 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from src.agents import create_planner_agent, create_reporter_agent, create_summarizer_agent
+from src.budget import aggregate_budget_usage, budget_exceeded, budget_from_config, with_budget_status
+from src.costs import estimate_cost, extract_token_usage
 from src.events import EventType, emit_event
+from src.llm import model_versions
 from src.memory.long_term import get_long_term_memory, save_research_memory, search_long_term_memory
 from src.memory.short_term import get_memory_context, get_short_term_memory
 from src.state import (
     ParseStatus,
     ReportArtifact,
     ResearchRun,
+    RunBudget,
     RunStatus,
     SourceItem,
     TaskPlan,
@@ -35,14 +39,11 @@ from src.validation import (
 )
 
 
-MAX_SEARCH_ATTEMPTS = 3
-
-
-def _create_llm():
+def _create_llm(role: str = "default"):
     """Create an LLM instance from the current configuration."""
     from src.llm import create_llm
 
-    return create_llm()
+    return create_llm(role=role)
 
 
 def _response_messages(response: Any) -> list[Any]:
@@ -110,6 +111,24 @@ def _collect_tool_sources(response: Any) -> dict[str, SourceItem]:
     return sources
 
 
+def _collect_tool_metadata(response: Any) -> dict[str, Any]:
+    """Read bounded cache/provider metadata exposed by this invocation's tool messages."""
+    cache_hit = False
+    providers: set[str] = set()
+    for message in _response_messages(response):
+        if _message_field(message, "type", "") != "tool":
+            continue
+        try:
+            payload = json.loads(_message_content(message))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        cache_hit = cache_hit or bool(payload.get("cache_hit"))
+        provider = payload.get("provider")
+        if isinstance(provider, str) and provider:
+            providers.add(provider)
+    return {"cache_hit": cache_hit, "providers": sorted(providers)}
+
+
 def _strip_reasoning(text: str) -> str:
     """Remove visible reasoning blocks before parsing or returning model text."""
     return text.split("</think>", 1)[-1].strip() if "</think>" in text else text.strip()
@@ -140,21 +159,27 @@ def _output_diagnostic(
     }
 
 
+def _format_repair_response(llm: Any, schema: str, raw_output: str) -> tuple[str, Any]:
+    """Run one format-only repair while preserving the provider response for accounting."""
+    response = llm.invoke(
+        [
+            (
+                "system",
+                "你只负责修复 JSON 结构。不得搜索、不得新增事实、不得解释。"
+                "将用户提供的内容改写为符合指定 schema 的单个 JSON 对象。",
+            ),
+            ("user", f"目标 schema：\n{schema}\n\n待修复内容：\n{raw_output}"),
+        ]
+    )
+    return _strip_reasoning(_message_content(response)), response
+
+
 def _format_repairer(llm: Any, schema: str) -> Callable[[str], str]:
-    """Return a one-shot, format-only repair callback for validation helpers."""
+    """Return a format-only repair callback for validation helpers."""
 
     def repair(raw_output: str) -> str:
-        response = llm.invoke(
-            [
-                (
-                    "system",
-                    "你只负责修复 JSON 结构。不得搜索、不得新增事实、不得解释。"
-                    "将用户提供的内容改写为符合指定 schema 的单个 JSON 对象。",
-                ),
-                ("user", f"目标 schema：\n{schema}\n\n待修复内容：\n{raw_output}"),
-            ]
-        )
-        return _strip_reasoning(_message_content(response))
+        repaired, _ = _format_repair_response(llm, schema, raw_output)
+        return repaired
 
     return repair
 
@@ -166,15 +191,14 @@ def _plan_repairer(llm: Any) -> Callable[[str], str]:
     )
 
 
-def _result_repair(llm: Any, raw_output: str, available_source_ids: set[str]) -> str:
+def _result_repair(llm: Any, raw_output: str, available_source_ids: set[str]) -> tuple[str, Any]:
     source_ids = ", ".join(sorted(available_source_ids)) or "(无)"
-    repairer = _format_repairer(
-        llm,
+    schema = (
         '{"summary":"至少 200 字的事实性总结","claims":[{"text":"可验证结论",'
         '"source_ids":["src_xxx"],"evidence_status":"supported"}]}。'
-        f"允许的 source_id：{source_ids}",
+        f"允许的 source_id：{source_ids}"
     )
-    return repairer(raw_output)
+    return _format_repair_response(llm, schema, raw_output)
 
 
 def _build_rejected_plan(topic: str, error: StructuredOutputError) -> TaskPlan:
@@ -195,17 +219,127 @@ def _new_run(
     llm: Any = None,
     output_diagnostics: dict[str, dict[str, Any]] | None = None,
 ) -> ResearchRun:
-    model_name = str(getattr(llm, "model_name", None) or getattr(llm, "model", None) or "")
+    from src.config import get_config
+
     return ResearchRun(
         thread_id=session_id or "",
         plan_id=plan.plan_id,
         plan_version=plan.plan_version,
         topic=topic,
         status=status,
-        model_versions={"default": model_name} if model_name else {},
+        model_versions=model_versions(),
         prompt_versions={"planner": "p0.1", "summarizer": "p0.2", "reporter": "p0.2"},
+        budget=budget_from_config(get_config()),
         output_diagnostics=output_diagnostics or {},
     )
+
+
+def _run_budget(state: dict[str, Any]) -> RunBudget:
+    """Read a persisted budget while keeping direct graph tests backward compatible."""
+    try:
+        return ResearchRun.model_validate(state.get("run") or {}).budget
+    except Exception:
+        from src.config import get_config
+
+        return budget_from_config(get_config())
+
+
+def _budget_usage(state: dict[str, Any]):
+    run = state.get("run") or {}
+    usage = aggregate_budget_usage(
+        dict(state.get("task_results") or {}),
+        created_at=run.get("created_at"),
+    )
+    return with_budget_status(_run_budget(state), usage)
+
+
+def _budget_usage_with_current_task(
+    state: dict[str, Any],
+    task_id: str,
+    attempts: int,
+    token_usage: dict[str, int],
+    estimated_cost: float | None,
+    cost_status: str,
+):
+    """Include in-flight task usage in a cooperative budget checkpoint."""
+    results = dict(state.get("task_results") or {})
+    results[task_id] = {
+        "task_id": task_id,
+        "attempts": max(attempts, 1),
+        "token_usage": token_usage,
+        "estimated_cost": estimated_cost,
+        "cost_status": cost_status,
+    }
+    run = state.get("run") or {}
+    usage = aggregate_budget_usage(results, created_at=run.get("created_at"))
+    return with_budget_status(_run_budget(state), usage)
+
+
+def _merge_token_usage(total: dict[str, int], additional: dict[str, int]) -> dict[str, int]:
+    """Accumulate provider usage across retries without depending on one SDK shape."""
+    merged = dict(total)
+    for key, value in additional.items():
+        if isinstance(value, int) and value >= 0:
+            merged[key] = int(merged.get(key) or 0) + value
+    if "total_tokens" not in merged and {"input_tokens", "output_tokens"} <= merged.keys():
+        merged["total_tokens"] = merged["input_tokens"] + merged["output_tokens"]
+    return merged
+
+
+def _budget_scope_reasons(results: dict[str, dict[str, Any]], usage: Any) -> list[str]:
+    """Return stable, human-readable budget reasons for final report scope notes."""
+    reasons = {
+        str(result.get("error_message") or "运行预算已耗尽。")
+        for result in results.values()
+        if result.get("error_code") == "BUDGET_EXCEEDED"
+    }
+    if getattr(usage, "exceeded_reason", None):
+        reasons.add(f"运行预算达到 {usage.exceeded_reason}。")
+    return sorted(reasons)
+
+
+def _append_budget_scope_limit(
+    report: str,
+    tasks: list[dict[str, Any]],
+    results: dict[str, dict[str, Any]],
+    usage: Any,
+) -> str:
+    """Keep budget-induced incompleteness explicit in the final Markdown artifact."""
+    reasons = _budget_scope_reasons(results, usage)
+    if not reasons:
+        return report
+    limited_tasks = [
+        str(task.get("title") or task.get("task_id") or "未命名任务")
+        for task in tasks
+        if (result := results.get(str(task.get("task_id") or "")))
+        and result.get("error_code") == "BUDGET_EXCEEDED"
+    ]
+    lines = [report.rstrip(), "", "## 执行范围限制"]
+    lines.extend(f"- {reason}" for reason in reasons)
+    if limited_tasks:
+        lines.append(f"- 未执行或提前停止的任务：{'、'.join(limited_tasks)}。")
+    lines.append("- 并行任务已启动后无法强制中断，Token、成本和时长预算对同批任务按协作式限制执行。")
+    return "\n".join(lines) + "\n"
+
+
+def _budget_failed_result(task: dict[str, Any], reason: str, attempts: int = 0) -> TaskResult:
+    """Make skipped work explicit so Reporter cannot turn a budget stop into success."""
+    return failed_task_result(
+        task,
+        max(attempts, 1),
+        "BUDGET_EXCEEDED",
+        f"运行预算已耗尽：{reason}。",
+        list(task.get("query_history") or [str(task.get("query") or "")]),
+    ).model_copy(update={"budget_status": "exceeded"})
+
+
+def _task_limit_failures(tasks: list[dict[str, Any]], budget: RunBudget) -> dict[str, dict[str, Any]]:
+    """Return deterministic failures for plan tasks beyond the strict dispatch limit."""
+    return {
+        str(task.get("task_id") or ""): _budget_failed_result(task, "MAX_TASKS").model_dump(mode="json")
+        for task in tasks[budget.max_tasks :]
+        if str(task.get("task_id") or "")
+    }
 
 
 def planner_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -223,13 +357,21 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
             existing_run = ResearchRun.model_validate(state.get("run") or {})
             if existing_run.status not in {RunStatus.CONFIRMED, RunStatus.RUNNING}:
                 raise ValueError("confirmed plan execution requires a confirmed or running run")
-            run = existing_run.model_copy(update={"status": RunStatus.RUNNING, "updated_at": utc_now()})
+            run = existing_run.model_copy(
+                update={
+                    "status": RunStatus.RUNNING,
+                    "updated_at": utc_now(),
+                    "model_versions": model_versions(),
+                }
+            )
             plan_payload = plan.model_dump(mode="json")
+            limit_failures = _task_limit_failures(plan_payload["tasks"], run.budget)
             emit_event(state, EventType.PLANNING, payload={"status": "succeeded", "task_count": len(plan.tasks)})
             return {
                 "run": run.model_dump(mode="json"),
                 "plan": plan_payload,
                 "tasks": plan_payload["tasks"],
+                "task_results": limit_failures,
                 "loop_count": int(state.get("loop_count", 0)) + 1,
             }
         except Exception as error:
@@ -250,7 +392,7 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
             }
 
     try:
-        llm = _create_llm()
+        llm = _create_llm("planner")
         agent = create_planner_agent(llm)
 
         try:
@@ -274,7 +416,16 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
 
 请为此主题规划研究任务，并严格遵循系统中的 JSON 输出契约。"""
         output = _strip_reasoning(_message_content(agent.invoke({"messages": [("user", prompt)]})))
-        plan = parse_task_plan_with_repair(output, topic, _plan_repairer(llm))
+        from src.config import get_config
+
+        budget = budget_from_config(get_config())
+        repairer = _plan_repairer(_create_llm("repair")) if budget.max_format_repairs else None
+        plan = parse_task_plan_with_repair(
+            output,
+            topic,
+            repairer,
+            max_repairs=budget.max_format_repairs,
+        )
         run = _new_run(
             topic,
             session_id,
@@ -318,6 +469,7 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
         "run": run.model_dump(mode="json"),
         "plan": plan_payload,
         "output_diagnostics": run.output_diagnostics,
+        "task_results": _task_limit_failures(plan_payload["tasks"], run.budget),
         # Kept while the REST and frontend APIs still consume the legacy list.
         "tasks": plan_payload["tasks"],
         "loop_count": int(state.get("loop_count", 0)) + 1,
@@ -368,43 +520,145 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
     previous_attempts = int(previous_result.get("attempts") or 0)
     previous_queries = previous_result.get("query_history") or []
     query_history: list[str] = [str(query) for query in previous_queries if str(query).strip()]
+    budget = _run_budget(state)
     last_error = ""
-    repair_attempted = False
     diagnostics: dict[str, dict[str, Any]] = {}
     collected_sources: dict[str, SourceItem] = {}
     source_refs: list[dict[str, Any]] = []
     task_id = str(task.get("task_id") or "unknown_task")
     task_started_at = time.perf_counter()
-    emit_event(state, EventType.TASK_STARTED, task_id=task_id, payload={"status": "started"})
+    cumulative_token_usage: dict[str, int] = {}
+    estimated_cost_total = 0.0
+    cost_observed = False
+    cost_unavailable = False
+    cache_hit = False
+
+    def cost_snapshot() -> tuple[float | None, str]:
+        if not cost_observed or cost_unavailable:
+            return None, "unavailable"
+        return round(estimated_cost_total, 12), "estimated"
+
+    def record_response_usage(response: Any, model: str) -> None:
+        """Accumulate every task-scoped model response, including format repairs."""
+        nonlocal cumulative_token_usage, estimated_cost_total, cost_observed, cost_unavailable
+        response_usage = extract_token_usage(response)
+        cumulative_token_usage = _merge_token_usage(cumulative_token_usage, response_usage)
+        response_cost, response_cost_status = estimate_cost(response_usage, model, pricing)
+        if response_cost_status == "estimated" and response_cost is not None:
+            estimated_cost_total += response_cost
+            cost_observed = True
+        else:
+            cost_unavailable = True
+
+    def usage_snapshot(attempts: int):
+        estimated_cost, cost_status = cost_snapshot()
+        return _budget_usage_with_current_task(
+            state,
+            task_id,
+            attempts,
+            cumulative_token_usage,
+            estimated_cost,
+            cost_status,
+        )
+
+    def decorate_result(result: TaskResult, attempts: int, budget_status: str) -> TaskResult:
+        estimated_cost, cost_status = cost_snapshot()
+        return result.model_copy(
+            update={
+                "attempts": max(result.attempts, attempts),
+                "latency_ms": int((time.perf_counter() - task_started_at) * 1000),
+                "token_usage": cumulative_token_usage,
+                "estimated_cost": estimated_cost,
+                "cost_status": cost_status,
+                "cache_hit": cache_hit,
+                "budget_status": budget_status,
+            }
+        )
+
+    def event_payload(result: TaskResult) -> dict[str, Any]:
+        return {
+            "status": result.status.value,
+            "attempt": result.attempts,
+            "latency_ms": result.latency_ms,
+            "token_usage": result.token_usage,
+            "estimated_cost": result.estimated_cost,
+            "cost_status": result.cost_status,
+            "cache_hit": result.cache_hit,
+            "budget_status": result.budget_status,
+        }
+
+    def budget_failure(reason: str, attempts: int) -> TaskResult:
+        return decorate_result(
+            _budget_failed_result(task, reason, attempts),
+            attempts,
+            "exceeded",
+        )
+
+    initial_usage = _budget_usage(state)
+    emit_event(
+        state,
+        EventType.TASK_STARTED,
+        task_id=task_id,
+        payload={
+            "status": "started",
+            "budget_status": "exceeded" if initial_usage.exhausted else "within_budget",
+            "cache_hit": False,
+            "token_usage": {},
+            "estimated_cost": None,
+            "cost_status": "unavailable",
+        },
+    )
+    if initial_usage.exhausted:
+        failed = budget_failure(initial_usage.exceeded_reason or "BUDGET_EXCEEDED", previous_attempts + 1)
+        payload = event_payload(failed)
+        payload["error_code"] = failed.error_code
+        emit_event(state, EventType.TASK_FAILED, task_id=task_id, payload=payload)
+        return _result_update(failed, [], task, original_query, failed.attempts, diagnostics, source_refs)
 
     try:
-        llm = _create_llm()
+        llm = _create_llm("summarizer")
         agent = create_summarizer_agent(llm)
     except Exception as error:
-        failed = failed_task_result(
-            task,
+        failed = decorate_result(
+            failed_task_result(
+                task,
+                previous_attempts + 1,
+                "SUMMARIZER_INITIALIZATION_FAILED",
+                _safe_error_message(error),
+                query_history or [original_query],
+            ),
             previous_attempts + 1,
-            "SUMMARIZER_INITIALIZATION_FAILED",
-            _safe_error_message(error),
-            query_history or [original_query],
+            "within_budget",
         )
         diagnostics[f"{failed.task_id}:init"] = _output_diagnostic(
             "", ParseStatus.REJECTED, "SUMMARIZER_INITIALIZATION_FAILED"
         )
-        emit_event(
-            state,
-            EventType.TASK_FAILED,
-            task_id=task_id,
-            payload={
-                "status": TaskStatus.FAILED.value,
-                "attempt": previous_attempts + 1,
-                "error_code": "SUMMARIZER_INITIALIZATION_FAILED",
-            },
-        )
-        return _result_update(failed, [], task, original_query, previous_attempts + 1, diagnostics, source_refs)
+        payload = event_payload(failed)
+        payload["error_code"] = "SUMMARIZER_INITIALIZATION_FAILED"
+        emit_event(state, EventType.TASK_FAILED, task_id=task_id, payload=payload)
+        return _result_update(failed, [], task, original_query, failed.attempts, diagnostics, source_refs)
 
-    for attempt in range(1, MAX_SEARCH_ATTEMPTS + 1):
+    from src.config import get_config
+
+    summarizer_model = model_versions().get("summarizer", get_config().llm.model)
+    pricing = get_config().routing.pricing
+    for attempt in range(1, budget.max_search_attempts + 1):
         cumulative_attempt = previous_attempts + attempt
+        before_attempt_usage = usage_snapshot(cumulative_attempt)
+        if before_attempt_usage.exhausted:
+            failed = budget_failure(before_attempt_usage.exceeded_reason or "BUDGET_EXCEEDED", cumulative_attempt)
+            payload = event_payload(failed)
+            payload["error_code"] = failed.error_code
+            emit_event(state, EventType.TASK_FAILED, task_id=task_id, payload=payload)
+            return _result_update(
+                failed,
+                list(collected_sources.values()),
+                task,
+                original_query,
+                failed.attempts,
+                diagnostics,
+                source_refs,
+            )
         alternatives = _generate_alternative_queries(original_query, attempt)
         query = alternatives[(attempt - 1) % len(alternatives)]
         query_history.append(query)
@@ -413,7 +667,14 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
             state,
             EventType.SEARCHING,
             task_id=task_id,
-            payload={"attempt": cumulative_attempt},
+            payload={
+                "attempt": cumulative_attempt,
+                "cache_hit": cache_hit,
+                "token_usage": cumulative_token_usage,
+                "estimated_cost": cost_snapshot()[0],
+                "cost_status": cost_snapshot()[1],
+                "budget_status": "within_budget",
+            },
         )
         prompt = f"""任务主题：{topic}
 任务名称：{task.get('title', '')}
@@ -427,6 +688,9 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
         try:
             response = agent.invoke({"messages": [("user", prompt)]})
             current_sources = _collect_tool_sources(response)
+            tool_metadata = _collect_tool_metadata(response)
+            cache_hit = cache_hit or bool(tool_metadata["cache_hit"])
+            record_response_usage(response, summarizer_model)
             for source_id, source in current_sources.items():
                 if source_id not in collected_sources:
                     collected_sources[source_id] = source
@@ -448,29 +712,80 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
                     available_sources=current_sources,
                 )
             except StructuredOutputError as parse_error:
-                if repair_attempted:
-                    raise parse_error
-                repair_attempted = True
-                repaired = _result_repair(llm, output, set(current_sources))
-                result, _ = parse_task_result(
-                    repaired,
-                    task,
-                    cumulative_attempt,
-                    query,
-                    parse_status=ParseStatus.REPAIRED,
-                    available_sources=current_sources,
-                )
-            diagnostics[diagnostic_key] = _output_diagnostic(output, result.parse_status)
-            emit_event(
-                state,
-                EventType.TASK_COMPLETED,
-                task_id=task_id,
-                payload={
-                    "status": result.status.value,
-                    "attempt": cumulative_attempt,
-                    "latency_ms": int((time.perf_counter() - task_started_at) * 1000),
-                },
+                after_response_usage = usage_snapshot(cumulative_attempt)
+                if after_response_usage.exhausted:
+                    failed = budget_failure(
+                        after_response_usage.exceeded_reason or "BUDGET_EXCEEDED",
+                        cumulative_attempt,
+                    )
+                    diagnostics[diagnostic_key] = _output_diagnostic(
+                        output, ParseStatus.REJECTED, failed.error_code
+                    )
+                    payload = event_payload(failed)
+                    payload["error_code"] = failed.error_code
+                    emit_event(state, EventType.TASK_FAILED, task_id=task_id, payload=payload)
+                    return _result_update(
+                        failed,
+                        list(collected_sources.values()),
+                        task,
+                        query,
+                        failed.attempts,
+                        diagnostics,
+                        source_refs,
+                    )
+                repair_error = parse_error
+                repair_llm = _create_llm("repair") if budget.max_format_repairs else None
+                repair_model = model_versions().get("repair", get_config().llm.model)
+                repaired_result: TaskResult | None = None
+                for _ in range(budget.max_format_repairs):
+                    repair_usage = usage_snapshot(cumulative_attempt)
+                    if repair_usage.exhausted:
+                        break
+                    try:
+                        repaired, repair_response = _result_repair(repair_llm, output, set(current_sources))
+                        record_response_usage(repair_response, repair_model)
+                        repaired_result, _ = parse_task_result(
+                            repaired,
+                            task,
+                            cumulative_attempt,
+                            query,
+                            parse_status=ParseStatus.REPAIRED,
+                            available_sources=current_sources,
+                        )
+                        break
+                    except StructuredOutputError as error:
+                        repair_error = error
+                else:
+                    raise repair_error
+                if repaired_result is None:
+                    exhausted = usage_snapshot(cumulative_attempt)
+                    if exhausted.exhausted:
+                        failed = budget_failure(exhausted.exceeded_reason or "BUDGET_EXCEEDED", cumulative_attempt)
+                        diagnostics[diagnostic_key] = _output_diagnostic(
+                            output, ParseStatus.REJECTED, failed.error_code
+                        )
+                        payload = event_payload(failed)
+                        payload["error_code"] = failed.error_code
+                        emit_event(state, EventType.TASK_FAILED, task_id=task_id, payload=payload)
+                        return _result_update(
+                            failed,
+                            list(collected_sources.values()),
+                            task,
+                            query,
+                            failed.attempts,
+                            diagnostics,
+                            source_refs,
+                        )
+                    raise repair_error
+                result = repaired_result
+            current_usage = usage_snapshot(cumulative_attempt)
+            result = decorate_result(
+                result,
+                cumulative_attempt,
+                "exhausted" if current_usage.exhausted else "within_budget",
             )
+            diagnostics[diagnostic_key] = _output_diagnostic(output, result.parse_status)
+            emit_event(state, EventType.TASK_COMPLETED, task_id=task_id, payload=event_payload(result))
             return _result_update(
                 result,
                 list(collected_sources.values()),
@@ -483,50 +798,93 @@ def search_summarize_node(state: dict[str, Any]) -> dict[str, Any]:
         except StructuredOutputError as error:
             last_error = f"{error.code}: {_safe_error_message(error)}"
             diagnostics[diagnostic_key] = _output_diagnostic(output, ParseStatus.REJECTED, error.code)
-            if attempt < MAX_SEARCH_ATTEMPTS:
+            after_error_usage = usage_snapshot(cumulative_attempt)
+            if after_error_usage.exhausted:
+                failed = budget_failure(after_error_usage.exceeded_reason or "BUDGET_EXCEEDED", cumulative_attempt)
+                payload = event_payload(failed)
+                payload["error_code"] = failed.error_code
+                emit_event(state, EventType.TASK_FAILED, task_id=task_id, payload=payload)
+                return _result_update(
+                    failed,
+                    list(collected_sources.values()),
+                    task,
+                    query,
+                    failed.attempts,
+                    diagnostics,
+                    source_refs,
+                )
+            if attempt < budget.max_search_attempts:
                 emit_event(
                     state,
                     EventType.RETRYING,
                     task_id=task_id,
-                    payload={"attempt": cumulative_attempt + 1, "error_code": error.code},
+                    payload={
+                        "attempt": cumulative_attempt + 1,
+                        "error_code": error.code,
+                        "cache_hit": cache_hit,
+                        "token_usage": cumulative_token_usage,
+                        "estimated_cost": cost_snapshot()[0],
+                        "cost_status": cost_snapshot()[1],
+                        "budget_status": "within_budget",
+                    },
                 )
         except Exception as error:
             last_error = _safe_error_message(error)
             diagnostics[diagnostic_key] = _output_diagnostic(
                 output, ParseStatus.REJECTED, "SUMMARIZER_EXECUTION_FAILED"
             )
-            if attempt < MAX_SEARCH_ATTEMPTS:
+            after_error_usage = usage_snapshot(cumulative_attempt)
+            if after_error_usage.exhausted:
+                failed = budget_failure(after_error_usage.exceeded_reason or "BUDGET_EXCEEDED", cumulative_attempt)
+                payload = event_payload(failed)
+                payload["error_code"] = failed.error_code
+                emit_event(state, EventType.TASK_FAILED, task_id=task_id, payload=payload)
+                return _result_update(
+                    failed,
+                    list(collected_sources.values()),
+                    task,
+                    query,
+                    failed.attempts,
+                    diagnostics,
+                    source_refs,
+                )
+            if attempt < budget.max_search_attempts:
                 emit_event(
                     state,
                     EventType.RETRYING,
                     task_id=task_id,
-                    payload={"attempt": cumulative_attempt + 1, "error_code": "SUMMARIZER_EXECUTION_FAILED"},
+                    payload={
+                        "attempt": cumulative_attempt + 1,
+                        "error_code": "SUMMARIZER_EXECUTION_FAILED",
+                        "cache_hit": cache_hit,
+                        "token_usage": cumulative_token_usage,
+                        "estimated_cost": cost_snapshot()[0],
+                        "cost_status": cost_snapshot()[1],
+                        "budget_status": "within_budget",
+                    },
                 )
 
-    failed = failed_task_result(
-        task,
-        previous_attempts + MAX_SEARCH_ATTEMPTS,
-        "SUMMARIZER_OUTPUT_REJECTED",
-        last_error or "未获得符合结构化契约的任务结果。",
-        query_history or [original_query],
+    attempts = previous_attempts + budget.max_search_attempts
+    failed = decorate_result(
+        failed_task_result(
+            task,
+            attempts,
+            "SUMMARIZER_OUTPUT_REJECTED",
+            last_error or "未获得符合结构化契约的任务结果。",
+            query_history or [original_query],
+        ),
+        attempts,
+        "within_budget",
     )
-    emit_event(
-        state,
-        EventType.TASK_FAILED,
-        task_id=task_id,
-        payload={
-            "status": TaskStatus.FAILED.value,
-            "attempt": previous_attempts + MAX_SEARCH_ATTEMPTS,
-            "error_code": failed.error_code or "SUMMARIZER_OUTPUT_REJECTED",
-            "latency_ms": int((time.perf_counter() - task_started_at) * 1000),
-        },
-    )
+    payload = event_payload(failed)
+    payload["error_code"] = failed.error_code or "SUMMARIZER_OUTPUT_REJECTED"
+    emit_event(state, EventType.TASK_FAILED, task_id=task_id, payload=payload)
     return _result_update(
         failed,
         list(collected_sources.values()),
         task,
         original_query,
-        previous_attempts + MAX_SEARCH_ATTEMPTS,
+        failed.attempts,
         diagnostics,
         source_refs,
     )
@@ -648,6 +1006,8 @@ def _updated_run(
     state: dict[str, Any],
     status: RunStatus,
     output_diagnostics: dict[str, dict[str, Any]],
+    *,
+    budget_usage: Any = None,
 ) -> ResearchRun:
     existing = state.get("run") or {}
     try:
@@ -656,6 +1016,7 @@ def _updated_run(
                 "status": status,
                 "updated_at": utc_now(),
                 "output_diagnostics": output_diagnostics,
+                "budget_usage": budget_usage or _budget_usage(state),
             }
         )
     except Exception:
@@ -666,6 +1027,7 @@ def _updated_run(
             plan_version=plan.get("plan_version"),
             topic=str(state.get("topic") or "未命名研究主题"),
             status=status,
+            budget_usage=budget_usage or _budget_usage(state),
             output_diagnostics=output_diagnostics,
         )
 
@@ -679,14 +1041,26 @@ def reporter_node(state: dict[str, Any]) -> dict[str, Any]:
     sources = dict(state.get("sources") or {})
     output_diagnostics = dict(state.get("output_diagnostics") or {})
     reporter_diagnostics: dict[str, dict[str, Any]] = {}
-    emit_event(state, EventType.REPORTING, payload={"status": "started"})
+    budget_usage = _budget_usage(state)
+    budget_limited = bool(_budget_scope_reasons(results, budget_usage))
+    emit_event(
+        state,
+        EventType.REPORTING,
+        payload={
+            "status": "started",
+            "budget_status": "exhausted" if budget_usage.exhausted else "within_budget",
+            "token_usage": {"total_tokens": budget_usage.total_tokens},
+            "estimated_cost": budget_usage.estimated_cost,
+            "cost_status": budget_usage.cost_status,
+        },
+    )
 
     if plan.get("parse_status") == ParseStatus.REJECTED.value:
         report = _rejected_plan_report(topic, plan)
         status = RunStatus.FAILED
     else:
         try:
-            llm = _create_llm()
+            llm = _create_llm("reporter")
             agent = create_reporter_agent(llm)
             raw_report = _strip_reasoning(
                 _message_content(agent.invoke({"messages": [("user", _build_report_prompt(topic, tasks, results, sources))]}))
@@ -699,6 +1073,7 @@ def reporter_node(state: dict[str, Any]) -> dict[str, Any]:
                 RunStatus.SUCCEEDED
                 if all(result.get("status") == TaskStatus.SUCCEEDED.value for result in results.values())
                 and len(results) == len(tasks)
+                and not budget_limited
                 else RunStatus.FAILED
             )
         except Exception as error:
@@ -708,8 +1083,9 @@ def reporter_node(state: dict[str, Any]) -> dict[str, Any]:
                 "", ParseStatus.REJECTED, "REPORTER_EXECUTION_FAILED"
             )
 
+    report = _append_budget_scope_limit(report, tasks, results, budget_usage)
     combined_diagnostics = {**output_diagnostics, **reporter_diagnostics}
-    run = _updated_run(state, status, combined_diagnostics)
+    run = _updated_run(state, status, combined_diagnostics, budget_usage=budget_usage)
     report_artifact = ReportArtifact(
         run_id=run.run_id,
         markdown=report,
@@ -718,7 +1094,14 @@ def reporter_node(state: dict[str, Any]) -> dict[str, Any]:
     emit_event(
         state,
         EventType.COMPLETED if status == RunStatus.SUCCEEDED else EventType.FAILED,
-        payload={"status": status.value, "stage": "reporting"},
+        payload={
+            "status": status.value,
+            "stage": "reporting",
+            "budget_status": "exhausted" if budget_limited else "within_budget",
+            "token_usage": {"total_tokens": budget_usage.total_tokens},
+            "estimated_cost": budget_usage.estimated_cost,
+            "cost_status": budget_usage.cost_status,
+        },
     )
 
     summaries = [
@@ -762,10 +1145,18 @@ def _split_tasks(state: dict[str, Any]) -> list[Send] | str:
     plan = state.get("plan") or {}
     if plan.get("parse_status") == ParseStatus.REJECTED.value:
         return "reporter"
-    tasks = _ordered_tasks(state)
+    budget = _run_budget(state)
+    tasks = _ordered_tasks(state)[: budget.max_tasks]
     retry_task_id = str(state.get("retry_task_id") or "")
     if retry_task_id:
         tasks = [task for task in tasks if str(task.get("task_id") or "") == retry_task_id]
+    results = dict(state.get("task_results") or {})
+    tasks = [
+        task
+        for task in tasks
+        if (result := results.get(str(task.get("task_id") or ""))) is None
+        or result.get("error_code") != "BUDGET_EXCEEDED"
+    ]
     if not tasks:
         return "reporter"
     return [Send("search_summarize", {**state, "task": task}) for task in tasks]

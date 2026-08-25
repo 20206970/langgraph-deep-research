@@ -59,10 +59,23 @@ class ChatOpenAIWithReasoning(ChatOpenAI):
         return payload
 
 
-def create_llm(**overrides) -> ChatOpenAIWithReasoning:
-    """Create a ChatOpenAIWithReasoning instance from the current config.
+def model_versions() -> dict[str, str]:
+    """Return the actual model selected for every supported production role."""
+    from src.config import get_config
+
+    config = get_config()
+    return {
+        role: config.routing.for_role(role).model or config.llm.model
+        for role in ("router", "planner", "summarizer", "reporter", "repair", "judge")
+    }
+
+
+def create_llm(role: str = "default", **overrides) -> ChatOpenAIWithReasoning:
+    """Create a role-aware ChatOpenAIWithReasoning instance from configuration.
 
     Args:
+        role: ``router``, ``planner``, ``summarizer``, ``reporter``, ``repair``,
+            ``judge`` or ``default``. All roles fall back to ``OPENAI_MODEL``.
         **overrides: Optional keyword arguments to override config values
                      (e.g., temperature=0.5).
 
@@ -72,9 +85,29 @@ def create_llm(**overrides) -> ChatOpenAIWithReasoning:
     from src.config import get_config
 
     config = get_config()
-    return ChatOpenAIWithReasoning(
-        model=overrides.get("model", config.llm.model),
-        base_url=overrides.get("base_url", config.llm.base_url),
-        api_key=overrides.get("api_key", config.llm.api_key),
-        temperature=overrides.get("temperature", config.llm.temperature),
+    if role == "default":
+        # Preserve the historical generic client behavior for chat and legacy evaluators.
+        model = overrides.get("model", config.llm.model)
+        temperature = overrides.get("temperature", config.llm.temperature)
+        max_tokens = overrides.get("max_tokens")
+    else:
+        role_config = config.routing.for_role(role)
+        model = overrides.get("model", role_config.model or config.llm.model)
+        temperature = overrides.get("temperature", role_config.temperature)
+        max_tokens = overrides.get("max_tokens", role_config.max_tokens)
+
+    llm_kwargs: dict[str, Any] = {
+        "model": model,
+        "base_url": overrides.get("base_url", config.llm.base_url),
+        "api_key": overrides.get("api_key", config.llm.api_key),
+        "temperature": temperature,
+    }
+    if max_tokens is not None:
+        llm_kwargs["max_tokens"] = max_tokens
+    llm = ChatOpenAIWithReasoning(**llm_kwargs)
+    object.__setattr__(
+        llm,
+        "research_role_metadata",
+        {"role": role, "model": model, "temperature": temperature, "max_tokens": max_tokens},
     )
+    return llm

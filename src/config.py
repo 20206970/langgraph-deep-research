@@ -1,6 +1,7 @@
 """Configuration management for LangGraph Deep Research"""
 
 import os
+import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -27,6 +28,61 @@ class LLMConfig(BaseModel):
     base_url: str = Field(default="https://api.openai.com/v1", description="Base URL")
     model: str = Field(default="gpt-4", description="Model name")
     temperature: float = Field(default=0.0, description="Temperature")
+
+
+class ModelRoleConfig(BaseModel):
+    """Per-role generation settings; an empty model falls back to ``OPENAI_MODEL``."""
+
+    model: str = Field(default="")
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    max_tokens: int = Field(default=1_200, ge=1)
+
+
+class ModelPricing(BaseModel):
+    """Explicit model pricing in currency units per one million tokens."""
+
+    input_per_million: float = Field(ge=0.0)
+    output_per_million: float = Field(ge=0.0)
+
+
+class ModelRoutingConfig(BaseModel):
+    """Role-to-model configuration and optional explicit price table."""
+
+    router: ModelRoleConfig = Field(default_factory=lambda: ModelRoleConfig(max_tokens=256))
+    planner: ModelRoleConfig = Field(default_factory=lambda: ModelRoleConfig(temperature=0.1, max_tokens=1_200))
+    summarizer: ModelRoleConfig = Field(default_factory=lambda: ModelRoleConfig(max_tokens=4_096))
+    reporter: ModelRoleConfig = Field(default_factory=lambda: ModelRoleConfig(temperature=0.1, max_tokens=4_096))
+    repair: ModelRoleConfig = Field(default_factory=lambda: ModelRoleConfig(max_tokens=1_200))
+    judge: ModelRoleConfig = Field(default_factory=lambda: ModelRoleConfig(max_tokens=1_200))
+    pricing: dict[str, ModelPricing] = Field(default_factory=dict)
+
+    def for_role(self, role: str) -> ModelRoleConfig:
+        if role == "default":
+            return ModelRoleConfig()
+        try:
+            return getattr(self, role)
+        except AttributeError as error:
+            raise ValueError(f"unknown LLM role: {role}") from error
+
+
+class SearchCacheConfig(BaseModel):
+    """SQLite TTL cache settings for live web and paper search only."""
+
+    enabled: bool = Field(default=True)
+    ttl_seconds: int = Field(default=86_400, ge=1)
+    language: str = Field(default="auto", min_length=1, max_length=32)
+    tool_version: str = Field(default="p1.3", min_length=1, max_length=100)
+
+
+class RunBudgetConfig(BaseModel):
+    """Default bounds applied when a new persisted or compatibility run starts."""
+
+    max_tasks: int = Field(default=5, ge=1, le=7)
+    max_search_attempts: int = Field(default=3, ge=1, le=10)
+    max_format_repairs: int = Field(default=1, ge=0, le=3)
+    max_total_tokens: int | None = Field(default=None, ge=1)
+    max_estimated_cost: float | None = Field(default=None, gt=0.0)
+    max_elapsed_seconds: int = Field(default=300, ge=1)
 
 
 class EmbeddingsConfig(BaseModel):
@@ -76,6 +132,9 @@ class Config(BaseSettings):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     tracing: TracingConfig = Field(default_factory=TracingConfig)
+    routing: ModelRoutingConfig = Field(default_factory=ModelRoutingConfig)
+    search_cache: SearchCacheConfig = Field(default_factory=SearchCacheConfig)
+    budget: RunBudgetConfig = Field(default_factory=RunBudgetConfig)
 
     class Config:
         env_prefix = ""
@@ -88,6 +147,40 @@ class Config(BaseSettings):
         embeddings_provider = (configured_embeddings_provider or "huggingface").lower()
         default_embeddings_model = "BAAI/bge-m3" if embeddings_provider == "huggingface" else "text-embedding-3-small"
         default_chroma_directory = "./chroma_data_bge_m3"
+        role_defaults = {
+            "router": (0.0, 256),
+            "planner": (0.1, 1_200),
+            "summarizer": (0.0, 4_096),
+            "reporter": (0.1, 4_096),
+            "repair": (0.0, 1_200),
+            "judge": (0.0, 1_200),
+        }
+
+        def role_config(role: str) -> ModelRoleConfig:
+            temperature, max_tokens = role_defaults[role]
+            prefix = role.upper()
+            return ModelRoleConfig(
+                model=os.getenv(f"{prefix}_MODEL", "").strip(),
+                temperature=float(os.getenv(f"{prefix}_TEMPERATURE", str(temperature))),
+                max_tokens=int(os.getenv(f"{prefix}_MAX_TOKENS", str(max_tokens))),
+            )
+
+        raw_pricing = os.getenv("MODEL_PRICING_JSON", "").strip()
+        try:
+            pricing_payload = json.loads(raw_pricing) if raw_pricing else {}
+        except json.JSONDecodeError as error:
+            raise ValueError("MODEL_PRICING_JSON must be a JSON object") from error
+        if not isinstance(pricing_payload, dict):
+            raise ValueError("MODEL_PRICING_JSON must be a JSON object")
+
+        def optional_int(name: str) -> int | None:
+            value = os.getenv(name, "").strip()
+            return int(value) if value and value != "0" else None
+
+        def optional_float(name: str) -> float | None:
+            value = os.getenv(name, "").strip()
+            return float(value) if value and value != "0" else None
+
         return cls(
             search=SearchConfig(
                 api=os.getenv("SEARCH_API", "tavily"),
@@ -139,6 +232,29 @@ class Config(BaseSettings):
                     for pattern in os.getenv("LANGSMITH_REDACT_PATTERNS", "").split(",")
                     if pattern.strip()
                 ],
+            ),
+            routing=ModelRoutingConfig(
+                router=role_config("router"),
+                planner=role_config("planner"),
+                summarizer=role_config("summarizer"),
+                reporter=role_config("reporter"),
+                repair=role_config("repair"),
+                judge=role_config("judge"),
+                pricing=pricing_payload,
+            ),
+            search_cache=SearchCacheConfig(
+                enabled=os.getenv("SEARCH_CACHE_ENABLED", "true").lower() in {"1", "true", "yes", "on"},
+                ttl_seconds=int(os.getenv("SEARCH_CACHE_TTL_SECONDS", "86400")),
+                language=os.getenv("SEARCH_LANGUAGE", "auto"),
+                tool_version=os.getenv("SEARCH_TOOL_VERSION", "p1.3"),
+            ),
+            budget=RunBudgetConfig(
+                max_tasks=int(os.getenv("RUN_MAX_TASKS", "5")),
+                max_search_attempts=int(os.getenv("RUN_MAX_SEARCH_ATTEMPTS", "3")),
+                max_format_repairs=int(os.getenv("RUN_MAX_FORMAT_REPAIRS", "1")),
+                max_total_tokens=optional_int("RUN_MAX_TOTAL_TOKENS"),
+                max_estimated_cost=optional_float("RUN_MAX_ESTIMATED_COST"),
+                max_elapsed_seconds=int(os.getenv("RUN_MAX_ELAPSED_SECONDS", "300")),
             ),
         )
 

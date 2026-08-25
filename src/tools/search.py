@@ -2,6 +2,7 @@
 
 import json
 import re
+from functools import lru_cache
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Optional
@@ -9,6 +10,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from langchain_core.tools import tool
 from pydantic import BaseModel
+
+from src.cache import SQLiteSearchCache, build_cache_key
 
 # 尝试导入 Tavily，如果失败则跳过
 try:
@@ -133,6 +136,76 @@ def _tool_output(result: dict, provider: str, source_type: str) -> str:
     if result.get("note"):
         output["note"] = result["note"]
     return json.dumps(output, ensure_ascii=False)
+
+
+@lru_cache(maxsize=1)
+def _live_search_cache() -> SQLiteSearchCache | None:
+    """Build one local cache handle; callers treat failures as cache misses."""
+    try:
+        from src.config import get_config
+
+        config = get_config()
+        if not config.search_cache.enabled:
+            return None
+        return SQLiteSearchCache(config.storage.sqlite_path, config.search_cache.ttl_seconds)
+    except Exception:
+        return None
+
+
+def _cache_metadata(payload: dict, *, cache_hit: bool, created_at: str | None = None, expires_at: str | None = None) -> str:
+    """Attach cache provenance without altering the normalized source snapshots."""
+    result = dict(payload)
+    result["cache_hit"] = cache_hit
+    if created_at:
+        result["cached_at"] = created_at
+    if expires_at:
+        result["expires_at"] = expires_at
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _cached_tool_output(
+    tool_name: str,
+    query: str,
+    max_results: int,
+    provider_config: dict,
+    producer,
+) -> str:
+    """Read/write normalized live-search JSON and safely fall back on cache errors."""
+    try:
+        from src.config import get_config
+
+        config = get_config()
+        cache = _live_search_cache()
+        if cache is None:
+            return _cache_metadata(json.loads(producer()), cache_hit=False)
+        cache_key = build_cache_key(
+            tool_name=tool_name,
+            query=query,
+            provider_config=provider_config,
+            language=config.search_cache.language,
+            max_results=max_results,
+            tool_version=config.search_cache.tool_version,
+        )
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return _cache_metadata(
+                cached.payload,
+                cache_hit=True,
+                created_at=cached.created_at,
+                expires_at=cached.expires_at,
+            )
+        payload = json.loads(producer())
+        if isinstance(payload, dict) and payload.get("results"):
+            entry = cache.put(cache_key, payload)
+            return _cache_metadata(payload, cache_hit=False, created_at=entry.created_at, expires_at=entry.expires_at)
+        return _cache_metadata(payload if isinstance(payload, dict) else {}, cache_hit=False)
+    except Exception:
+        # A cache fault must remain observable as a miss, while live search keeps working.
+        try:
+            payload = json.loads(producer())
+        except Exception:
+            return producer()
+        return _cache_metadata(payload if isinstance(payload, dict) else {}, cache_hit=False)
 
 
 def _generate_fallback_queries(query: str) -> list[str]:
@@ -426,8 +499,7 @@ def _search_semantic_scholar(query: str, max_results: int = 5) -> dict:
         return {"results": [], "error": str(e)}
 
 
-@tool
-def search_papers(query: str, max_results: int = 5) -> str:
+def _search_papers_live(query: str, max_results: int = 5) -> str:
     """
     搜索学术论文，覆盖 ArXiv 和 Semantic Scholar 数据库。
     适用于查找研究论文、学术文献、技术报告等。
@@ -459,18 +531,19 @@ def search_papers(query: str, max_results: int = 5) -> str:
 
 
 @tool
-def search_web(query: str, max_results: int = 5) -> str:
-    """
-    执行网络搜索，返回相关网页内容和摘要。
-    使用 Tavily 作为主搜索，当失败时自动降级到 DuckDuckGo 和 Wikipedia。
+def search_papers(query: str, max_results: int = 5) -> str:
+    """Search academic sources with a TTL cache around normalized source snapshots."""
+    return _cached_tool_output(
+        "search_papers",
+        query,
+        max_results,
+        {"providers": ["arxiv", "semantic_scholar"], "arxiv_available": ARXIV_AVAILABLE, "httpx_available": HTTPX_AVAILABLE},
+        lambda: _search_papers_live(query, max_results),
+    )
 
-    Args:
-        query: 搜索查询关键词
-        max_results: 返回结果数量，默认5条
 
-    Returns:
-        JSON 格式的标准化来源，包含 source_id、URL、证据摘要和抓取时间
-    """
+def _search_web_live(query: str, max_results: int = 5) -> str:
+    """Execute the original live web search/fallback flow without cache handling."""
     # 获取 API 配置
     api_key = None
     try:
@@ -519,4 +592,38 @@ def search_web(query: str, max_results: int = 5) -> str:
         {"answer": None, "results": [], "note": f"未找到与 '{query}' 相关的搜索结果"},
         "unknown",
         "web",
+    )
+
+
+@tool
+def search_web(query: str, max_results: int = 5) -> str:
+    """
+    执行网络搜索，返回相关网页内容和摘要。
+    使用 Tavily 作为主搜索，当失败时自动降级到 DuckDuckGo 和 Wikipedia。
+
+    Args:
+        query: 搜索查询关键词
+        max_results: 返回结果数量，默认5条
+
+    Returns:
+        JSON 格式的标准化来源，包含 source_id、URL、证据摘要和抓取时间
+    """
+    try:
+        from src.config import get_config
+
+        config = get_config()
+        provider_config = {
+            "primary": config.search.api,
+            "tavily_configured": bool(config.search.tavily_api_key),
+            "ddgs_available": DDGS_AVAILABLE,
+            "fallback": "wikipedia",
+        }
+    except Exception:
+        provider_config = {"primary": "unknown", "tavily_configured": False, "ddgs_available": DDGS_AVAILABLE}
+    return _cached_tool_output(
+        "search_web",
+        query,
+        max_results,
+        provider_config,
+        lambda: _search_web_live(query, max_results),
     )

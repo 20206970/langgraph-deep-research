@@ -117,23 +117,27 @@ def parse_task_plan_with_repair(
     text: str,
     topic: str,
     repairer: Optional[Repairer] = None,
+    max_repairs: int = 1,
 ) -> TaskPlan:
-    """Parse a plan once, then use at most one caller-provided format repair."""
+    """Parse a plan, then use a bounded number of caller-provided format repairs."""
     try:
         return parse_task_plan(text, topic)
     except StructuredOutputError as first_error:
-        if repairer is None:
+        if repairer is None or max_repairs <= 0:
             raise first_error
-
-        try:
-            repaired = repairer(text)
-            return parse_task_plan(repaired, topic, ParseStatus.REPAIRED)
-        except Exception as repair_error:
-            error = _to_structured_error(repair_error, "PLAN_REPAIR_FAILED")
-            raise StructuredOutputError(
-                "PLAN_REPAIR_FAILED",
-                f"初次解析失败({first_error.code})，修复后仍无效：{error}",
-            ) from repair_error
+        current_text = text
+        last_error: Exception = first_error
+        for _ in range(max_repairs):
+            try:
+                current_text = repairer(current_text)
+                return parse_task_plan(current_text, topic, ParseStatus.REPAIRED)
+            except Exception as repair_error:
+                last_error = repair_error
+        error = _to_structured_error(last_error, "PLAN_REPAIR_FAILED")
+        raise StructuredOutputError(
+            "PLAN_REPAIR_FAILED",
+            f"初次解析失败({first_error.code})，修复后仍无效：{error}",
+        ) from last_error
 
 
 def _source_id(title: str, url: Optional[str]) -> str:
@@ -239,30 +243,34 @@ def parse_task_result_with_repair(
     query: str,
     repairer: Optional[Repairer] = None,
     available_sources: Optional[dict[str, SourceItem | dict[str, Any]]] = None,
+    max_repairs: int = 1,
 ) -> tuple[TaskResult, list[SourceItem]]:
-    """Parse a task result once, then use at most one format-only repair."""
+    """Parse a task result, then use bounded format-only repair attempts."""
     try:
         return parse_task_result(text, task, attempt, query, available_sources=available_sources)
     except StructuredOutputError as first_error:
-        if repairer is None:
+        if repairer is None or max_repairs <= 0:
             raise first_error
-
-        try:
-            repaired = repairer(text)
-            return parse_task_result(
-                repaired,
-                task,
-                attempt,
-                query,
-                ParseStatus.REPAIRED,
-                available_sources,
-            )
-        except Exception as repair_error:
-            error = _to_structured_error(repair_error, "SUMMARY_REPAIR_FAILED")
-            raise StructuredOutputError(
-                "SUMMARY_REPAIR_FAILED",
-                f"初次解析失败({first_error.code})，修复后仍无效：{error}",
-            ) from repair_error
+        current_text = text
+        last_error: Exception = first_error
+        for _ in range(max_repairs):
+            try:
+                current_text = repairer(current_text)
+                return parse_task_result(
+                    current_text,
+                    task,
+                    attempt,
+                    query,
+                    ParseStatus.REPAIRED,
+                    available_sources,
+                )
+            except Exception as repair_error:
+                last_error = repair_error
+        error = _to_structured_error(last_error, "SUMMARY_REPAIR_FAILED")
+        raise StructuredOutputError(
+            "SUMMARY_REPAIR_FAILED",
+            f"初次解析失败({first_error.code})，修复后仍无效：{error}",
+        ) from last_error
 
 
 def failed_task_result(
