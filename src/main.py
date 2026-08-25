@@ -3,7 +3,7 @@
 import sys
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from loguru import logger
@@ -32,8 +32,11 @@ from src.agents.followup import handle_followup, handle_general
 from src.memory.short_term import add_to_short_term_memory, create_short_term_memory
 from src.events import EventPublisher, EventType, ResearchEvent, encode_sse, register_publisher, unregister_publisher
 from src.repository import InvalidStateTransitionError, NotFoundError, RepositoryError, SQLiteRepository
-from src.state import ParseStatus, TaskItem, TaskPlan, TaskStatus
+from src.state import ParseStatus, TaskItem, TaskPlan, TaskStatus, new_id
 from src.tracing import build_trace_callbacks
+from src.documents.models import DocumentDetailView, DocumentListResponse, DocumentVersionView, IngestionJobView, StorageUsageView
+from src.documents.repository import DocumentQuotaExceededError, DocumentRepository
+from src.documents.storage import DocumentStorage, DocumentStorageError, DocumentTooLargeError, UnsupportedDocumentTypeError
 
 # 配置日志
 logger.add(
@@ -235,11 +238,15 @@ def create_app(
     graph_factory: Callable[..., Any] = create_research_graph,
     *,
     initialize_services: bool = True,
+    document_repository: DocumentRepository | None = None,
+    document_storage: DocumentStorage | None = None,
 ) -> FastAPI:
     """创建 FastAPI 应用"""
     app = FastAPI(title="LangGraph Deep Researcher")
     app.state.repository = repository
     app.state.owns_repository = repository is None
+    app.state.document_repository = document_repository
+    app.state.document_storage = document_storage
 
     app.add_middleware(
         CORSMiddleware,
@@ -255,6 +262,10 @@ def create_app(
         config = get_config()
         if app.state.repository is None:
             app.state.repository = SQLiteRepository(config.storage.sqlite_path)
+        if app.state.document_repository is None:
+            app.state.document_repository = DocumentRepository(app.state.repository.database_path, config.documents)
+        if app.state.document_storage is None:
+            app.state.document_storage = DocumentStorage(config.documents)
 
         if not initialize_services:
             return
@@ -292,6 +303,39 @@ def create_app(
             app.state.repository = repository_instance
         return repository_instance
 
+    def active_document_repository() -> DocumentRepository:
+        repository_instance = app.state.document_repository
+        if repository_instance is None:
+            repository_instance = DocumentRepository(active_repository().database_path, get_config().documents)
+            app.state.document_repository = repository_instance
+        return repository_instance
+
+    def active_document_storage() -> DocumentStorage:
+        storage = app.state.document_storage
+        if storage is None:
+            storage = DocumentStorage(get_config().documents)
+            app.state.document_storage = storage
+        return storage
+
+    def document_detail(record: dict[str, Any]) -> DocumentDetailView:
+        return DocumentDetailView(
+            **record["document"],
+            current_version=record.get("current_version"),
+            versions=record.get("versions") or [],
+            jobs=record.get("jobs") or [],
+        )
+
+    def document_http_error(error: Exception) -> HTTPException:
+        if isinstance(error, DocumentTooLargeError | DocumentQuotaExceededError):
+            return HTTPException(status_code=413, detail=str(error))
+        if isinstance(error, UnsupportedDocumentTypeError):
+            return HTTPException(status_code=415, detail=str(error))
+        if isinstance(error, DocumentStorageError):
+            return HTTPException(status_code=400, detail=str(error))
+        if isinstance(error, RepositoryError):
+            return _repository_http_error(error)
+        return HTTPException(status_code=500, detail="document lifecycle operation failed")
+
     @app.get("/healthz")
     def health_check() -> Dict[str, str]:
         return {"status": "ok"}
@@ -319,6 +363,141 @@ def create_app(
     @app.get("/auth/me", response_model=CurrentUser)
     def current_identity(current_user: CurrentUser = Depends(require_current_user)) -> CurrentUser:
         return current_user
+
+    @app.get("/documents/usage", response_model=StorageUsageView)
+    def get_document_usage(current_user: CurrentUser = Depends(require_current_user)) -> StorageUsageView:
+        return StorageUsageView(**active_document_repository().usage(current_user.user_id))
+
+    @app.post("/documents", response_model=DocumentDetailView, status_code=201)
+    async def upload_document(
+        file: UploadFile = File(...),
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> DocumentDetailView:
+        document_id = new_id("doc")
+        version_id = new_id("ver")
+        storage = active_document_storage()
+        try:
+            stored = await storage.store_upload(
+                file,
+                owner_id=current_user.user_id,
+                document_id=document_id,
+                version_id=version_id,
+            )
+            record = active_document_repository().create_document(
+                stored,
+                owner_id=current_user.user_id,
+                document_id=document_id,
+                version_id=version_id,
+            )
+            return document_detail(record)
+        except Exception as error:
+            storage.remove_version(owner_id=current_user.user_id, document_id=document_id, version_id=version_id)
+            raise document_http_error(error) from error
+
+    @app.get("/documents", response_model=DocumentListResponse)
+    def list_documents(
+        limit: int = Query(default=20, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+        include_deleted: bool = Query(default=False),
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> DocumentListResponse:
+        records, total = active_document_repository().list_documents(
+            owner_id=current_user.user_id,
+            limit=limit,
+            offset=offset,
+            include_deleted=include_deleted,
+        )
+        return DocumentListResponse(
+            items=[DocumentDetailView(**record["document"], current_version=record.get("current_version")).model_copy() for record in records],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
+
+    @app.get("/documents/{document_id}", response_model=DocumentDetailView)
+    def get_document(document_id: str, current_user: CurrentUser = Depends(require_current_user)) -> DocumentDetailView:
+        try:
+            return document_detail(active_document_repository().get_document(document_id, owner_id=current_user.user_id))
+        except Exception as error:
+            raise document_http_error(error) from error
+
+    @app.get("/documents/{document_id}/versions", response_model=list[DocumentVersionView])
+    def list_document_versions(
+        document_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> list[DocumentVersionView]:
+        try:
+            return document_detail(active_document_repository().get_document(document_id, owner_id=current_user.user_id)).versions
+        except Exception as error:
+            raise document_http_error(error) from error
+
+    @app.get("/documents/{document_id}/jobs", response_model=list[IngestionJobView])
+    def list_document_jobs(
+        document_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> list[IngestionJobView]:
+        try:
+            return document_detail(active_document_repository().get_document(document_id, owner_id=current_user.user_id)).jobs
+        except Exception as error:
+            raise document_http_error(error) from error
+
+    @app.post("/documents/{document_id}/versions", response_model=DocumentDetailView, status_code=201)
+    async def upload_document_version(
+        document_id: str,
+        file: UploadFile = File(...),
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> DocumentDetailView:
+        repository_instance = active_document_repository()
+        try:
+            repository_instance.get_document(document_id, owner_id=current_user.user_id)
+        except Exception as error:
+            raise document_http_error(error) from error
+        version_id = new_id("ver")
+        storage = active_document_storage()
+        try:
+            stored = await storage.store_upload(
+                file,
+                owner_id=current_user.user_id,
+                document_id=document_id,
+                version_id=version_id,
+            )
+            record = repository_instance.create_version(
+                document_id,
+                stored,
+                owner_id=current_user.user_id,
+                version_id=version_id,
+            )
+            return document_detail(record)
+        except Exception as error:
+            storage.remove_version(owner_id=current_user.user_id, document_id=document_id, version_id=version_id)
+            raise document_http_error(error) from error
+
+    @app.post("/documents/{document_id}/versions/{version_id}/retry", response_model=DocumentDetailView)
+    def retry_document_version(
+        document_id: str,
+        version_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> DocumentDetailView:
+        try:
+            return document_detail(
+                active_document_repository().retry_version(document_id, version_id, owner_id=current_user.user_id)
+            )
+        except Exception as error:
+            raise document_http_error(error) from error
+
+    @app.delete("/documents/{document_id}", response_model=DocumentDetailView)
+    def delete_document(document_id: str, current_user: CurrentUser = Depends(require_current_user)) -> DocumentDetailView:
+        try:
+            return document_detail(active_document_repository().delete_document(document_id, owner_id=current_user.user_id))
+        except Exception as error:
+            raise document_http_error(error) from error
+
+    @app.post("/documents/{document_id}/restore", response_model=DocumentDetailView)
+    def restore_document(document_id: str, current_user: CurrentUser = Depends(require_current_user)) -> DocumentDetailView:
+        try:
+            return document_detail(active_document_repository().restore_document(document_id, owner_id=current_user.user_id))
+        except Exception as error:
+            raise document_http_error(error) from error
 
     @app.post("/plans")
     def create_persisted_plan(
