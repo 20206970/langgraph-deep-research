@@ -8,6 +8,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Final
 from uuid import uuid4
 
 from fastapi import UploadFile
@@ -45,6 +46,8 @@ class DocumentStorage:
         ".markdown": {"text/markdown", "text/plain"},
     }
     _CHUNK_SIZE = 64 * 1024
+    _CONVERTED_MARKDOWN: Final[str] = "converted.md"
+    _IMAGES_DIRECTORY: Final[str] = "images"
 
     def __init__(self, config: DocumentConfig):
         self.config = config
@@ -73,6 +76,85 @@ class DocumentStorage:
         if not directory.is_relative_to(self.root):
             raise DocumentStorageError("unsafe private storage path")
         return directory
+
+    @staticmethod
+    def _safe_artifact_name(value: str) -> str:
+        candidate = Path(value).name
+        if not candidate or candidate in {".", ".."} or candidate != value:
+            raise DocumentStorageError("invalid derived artifact name")
+        return candidate
+
+    def resolve_version_file(
+        self,
+        relative_path: str,
+        *,
+        owner_id: str,
+        document_id: str,
+        version_id: str,
+    ) -> Path:
+        """Resolve an internal database path without allowing it to escape its version directory."""
+
+        version_directory = self._version_directory(owner_id, document_id, version_id)
+        candidate = (self.root / Path(relative_path)).resolve()
+        if not candidate.is_relative_to(version_directory) or not candidate.is_file():
+            raise DocumentStorageError("private document file is unavailable")
+        return candidate
+
+    @staticmethod
+    def _atomic_write(path: Path, content: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_name(f".{uuid4().hex}.writing")
+        try:
+            with temporary_path.open("xb") as handle:
+                handle.write(content)
+            os.replace(temporary_path, path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    def write_converted_markdown(
+        self,
+        markdown: str,
+        *,
+        owner_id: str,
+        document_id: str,
+        version_id: str,
+    ) -> str:
+        """Persist normalized Markdown beside the source file using an atomic replacement."""
+
+        version_directory = self._version_directory(owner_id, document_id, version_id)
+        destination = version_directory / self._CONVERTED_MARKDOWN
+        self._atomic_write(destination, markdown.encode("utf-8"))
+        return destination.relative_to(self.root).as_posix()
+
+    def write_extracted_image(
+        self,
+        image_id: str,
+        content: bytes,
+        *,
+        suffix: str,
+        owner_id: str,
+        document_id: str,
+        version_id: str,
+    ) -> str:
+        """Write a converter-produced image under a generated, non-user-controlled name."""
+
+        safe_id = self._safe_artifact_name(image_id)
+        normalized_suffix = suffix.lower() if suffix.startswith(".") else f".{suffix.lower()}"
+        if normalized_suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+            normalized_suffix = ".png"
+        version_directory = self._version_directory(owner_id, document_id, version_id)
+        destination = version_directory / self._IMAGES_DIRECTORY / f"{safe_id}{normalized_suffix}"
+        self._atomic_write(destination, content)
+        return destination.relative_to(self.root).as_posix()
+
+    def clear_derived_artifacts(self, *, owner_id: str, document_id: str, version_id: str) -> None:
+        """Remove only retryable conversion outputs while preserving the validated source upload."""
+
+        version_directory = self._version_directory(owner_id, document_id, version_id)
+        (version_directory / self._CONVERTED_MARKDOWN).unlink(missing_ok=True)
+        images_directory = version_directory / self._IMAGES_DIRECTORY
+        if images_directory.exists():
+            shutil.rmtree(images_directory)
 
     @staticmethod
     def _validate_markdown_utf8(path: Path) -> None:

@@ -10,6 +10,7 @@ from typing import Any
 from src.config import get_config
 
 from .jobs import DocumentWorker, IngestionHandler
+from .pipeline import build_document_ingestion_pipeline
 from .repository import DocumentRepository
 
 
@@ -25,15 +26,16 @@ def _load_handler(reference: str) -> IngestionHandler:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run private document ingestion jobs")
-    parser.add_argument("--handler", required=True, help="P2.3 processor in module:function form")
+    parser.add_argument("--handler", help="Optional custom processor in module:function form")
     parser.add_argument("--once", action="store_true", help="Process at most one leased job")
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     args = parser.parse_args()
 
     config = get_config()
+    handler = _load_handler(args.handler) if args.handler else build_document_ingestion_pipeline(config)
     worker = DocumentWorker(
-        DocumentRepository(config.storage.sqlite_path, config.documents),
-        _load_handler(args.handler),
+        handler.repository if hasattr(handler, "repository") else DocumentRepository(config.storage.sqlite_path, config.documents),
+        handler,
         worker_id=f"worker_{socket.gethostname()}_{__import__('os').getpid()}",
     )
     if args.once:

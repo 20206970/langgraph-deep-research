@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from src.config import DocumentConfig
 from src.events import redact_text
 from src.repository import InvalidStateTransitionError, NotFoundError, RepositoryError
 from src.state import new_id, utc_now
 
-from .models import DocumentVersionStatus, IngestionJobStatus, IngestionStage, VisionStatus
+from .models import (
+    DocumentChunk,
+    DocumentImage,
+    DocumentParent,
+    DocumentVersionStatus,
+    IngestionJobStatus,
+    IngestionStage,
+    VisionStatus,
+)
 from .storage import StoredUpload
 
 
@@ -352,6 +361,144 @@ class DocumentRepository:
                 items.append({"document": document, "current_version": self._bool_fields(dict(current)) if current else None})
         return items, total
 
+    def _require_active_job(self, connection: sqlite3.Connection, job_id: str) -> dict[str, Any]:
+        row = connection.execute(
+            """
+            SELECT jobs.*, versions.document_id, versions.status AS version_status, documents.deleted_at
+            FROM ingestion_jobs AS jobs
+            JOIN document_versions AS versions ON versions.version_id = jobs.version_id
+            JOIN documents AS documents ON documents.document_id = versions.document_id
+            WHERE jobs.job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("ingestion job not found")
+        job = dict(row)
+        if (
+            job["status"] != IngestionJobStatus.PROCESSING.value
+            or job["version_status"] != DocumentVersionStatus.PROCESSING.value
+            or job["deleted_at"] is not None
+        ):
+            raise InvalidStateTransitionError("ingestion job is no longer active")
+        return job
+
+    def update_ingestion_stage(self, job_id: str, stage: IngestionStage) -> None:
+        """Advance the visible stage only while the claimed job and document remain active."""
+
+        now = utc_now()
+        with self._transaction(immediate=True) as connection:
+            self._require_active_job(connection, job_id)
+            connection.execute(
+                "UPDATE ingestion_jobs SET stage = ?, updated_at = ? WHERE job_id = ?",
+                (stage.value, now, job_id),
+            )
+
+    def record_conversion(
+        self,
+        job_id: str,
+        *,
+        markdown_path: str,
+        converter_fingerprint: str,
+    ) -> None:
+        """Persist conversion provenance without storing source text in SQLite."""
+
+        now = utc_now()
+        with self._transaction(immediate=True) as connection:
+            job = self._require_active_job(connection, job_id)
+            connection.execute(
+                """
+                UPDATE document_versions
+                SET markdown_path = ?, converter_fingerprint = ?, updated_at = ?
+                WHERE version_id = ?
+                """,
+                (markdown_path, converter_fingerprint[:256], now, job["version_id"]),
+            )
+
+    def replace_ingestion_artifacts(
+        self,
+        job_id: str,
+        *,
+        parents: Sequence[DocumentParent],
+        chunks: Sequence[DocumentChunk],
+        images: Sequence[DocumentImage],
+        vision_status: VisionStatus,
+    ) -> None:
+        """Atomically replace retryable conversion/chunking artifacts for one leased version."""
+
+        now = utc_now()
+        with self._transaction(immediate=True) as connection:
+            job = self._require_active_job(connection, job_id)
+            version_id = str(job["version_id"])
+            parent_ids = {parent.parent_id for parent in parents}
+            if not parents or any(parent.version_id != version_id for parent in parents):
+                raise RepositoryError("ingestion parents must belong to the claimed document version")
+            if any(chunk.parent_id not in parent_ids for chunk in chunks):
+                raise RepositoryError("ingestion chunks must reference a persisted parent")
+            if any(image.version_id != version_id or (image.parent_id and image.parent_id not in parent_ids) for image in images):
+                raise RepositoryError("ingestion images must belong to the claimed document version")
+
+            connection.execute("DELETE FROM document_chunks_fts WHERE version_id = ?", (version_id,))
+            connection.execute("DELETE FROM document_images WHERE version_id = ?", (version_id,))
+            connection.execute("DELETE FROM document_parents WHERE version_id = ?", (version_id,))
+            connection.executemany(
+                """
+                INSERT INTO document_parents(parent_id, version_id, logical_heading_path, physical_index, text, locator)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        parent.parent_id,
+                        parent.version_id,
+                        parent.logical_heading_path,
+                        parent.physical_index,
+                        parent.text,
+                        parent.locator,
+                    )
+                    for parent in parents
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO document_chunks(chunk_id, parent_id, kind, text, page_start, page_end, chroma_id, fts_rowid)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                [
+                    (
+                        chunk.chunk_id,
+                        chunk.parent_id,
+                        chunk.kind,
+                        chunk.text,
+                        chunk.page_start,
+                        chunk.page_end,
+                    )
+                    for chunk in chunks
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO document_images(image_id, version_id, parent_id, page, path, caption, vision_status, vision_metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        image.image_id,
+                        image.version_id,
+                        image.parent_id,
+                        image.page,
+                        image.path,
+                        image.caption,
+                        image.vision_status.value,
+                        json.dumps(image.vision_metadata, ensure_ascii=True, sort_keys=True),
+                    )
+                    for image in images
+                ],
+            )
+            connection.execute(
+                "UPDATE document_versions SET vision_status = ?, updated_at = ? WHERE version_id = ?",
+                (vision_status.value, now, version_id),
+            )
+
     def mark_version_ready(self, document_id: str, version_id: str, *, owner_id: str) -> dict[str, Any]:
         """Atomically promote a successfully indexed version and archive the prior current version."""
 
@@ -548,7 +695,8 @@ class DocumentRepository:
             self._recover_expired_jobs(connection, now=current_time)
             row = connection.execute(
                 """
-                SELECT jobs.*, versions.document_id FROM ingestion_jobs AS jobs
+                SELECT jobs.*, versions.document_id, versions.source_path, versions.source_filename,
+                       versions.source_media_type FROM ingestion_jobs AS jobs
                 JOIN document_versions AS versions ON versions.version_id = jobs.version_id
                 JOIN documents AS documents ON documents.document_id = versions.document_id
                 WHERE jobs.status = ? AND versions.status = ? AND documents.deleted_at IS NULL

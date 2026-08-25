@@ -10,6 +10,14 @@ from src.repository import InvalidStateTransitionError
 from .repository import DocumentRepository
 
 
+class IngestionProcessingError(RuntimeError):
+    """A pipeline stage failed with a stable, user-safe error code."""
+
+    def __init__(self, error_code: str, message: str):
+        super().__init__(message)
+        self.error_code = error_code
+
+
 class IngestionHandler(Protocol):
     """The P2.3 conversion pipeline will implement this one-job callback."""
 
@@ -45,13 +53,17 @@ class DocumentWorker:
             try:
                 self.repository.fail_job(
                     str(job["job_id"]),
-                    error_code="INGESTION_HANDLER_FAILED",
+                    error_code=getattr(error, "error_code", "INGESTION_HANDLER_FAILED"),
                     error_summary=str(error),
                 )
             except InvalidStateTransitionError:
                 # A delete request may cancel the leased job while its handler is still running.
                 return JobRunResult(job_id=str(job["job_id"]), status="cancelled", error_code="DOCUMENT_CANCELLED")
-            return JobRunResult(job_id=str(job["job_id"]), status="failed", error_code="INGESTION_HANDLER_FAILED")
+            return JobRunResult(
+                job_id=str(job["job_id"]),
+                status="failed",
+                error_code=getattr(error, "error_code", "INGESTION_HANDLER_FAILED"),
+            )
         return JobRunResult(job_id=str(job["job_id"]), status="succeeded")
 
     def run_forever(self, *, poll_seconds: float = 1.0, should_stop: Callable[[], bool] | None = None) -> None:
