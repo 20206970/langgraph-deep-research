@@ -17,6 +17,13 @@ def _plan(topic="durable topic"):
     )
 
 
+def _register(client: TestClient, username: str) -> tuple[dict[str, str], str]:
+    response = client.post("/auth/register", json={"username": username, "password": "correct-horse-42"})
+    assert response.status_code == 201
+    payload = response.json()
+    return {"Authorization": f"Bearer {payload['access_token']}"}, payload["user"]["user_id"]
+
+
 def _failed_graph_result(run, plan, attempt=1):
     task_id = plan["tasks"][0]["task_id"]
     graph_run = dict(run)
@@ -182,26 +189,35 @@ def test_plan_confirmation_api_blocks_execution_until_confirmed_and_retries_fail
     )
 
     with TestClient(app) as client:
-        planned = client.post("/plans", json={"topic": "API topic"})
+        headers, _ = _register(client, "durable_api_user")
+        planned = client.post("/plans", json={"topic": "API topic"}, headers=headers)
         assert planned.status_code == 200
         plan = planned.json()["plan"]
 
-        unconfirmed = client.post("/runs", json={"plan_id": plan["plan_id"], "plan_version": plan["plan_version"]})
+        unconfirmed = client.post(
+            "/runs",
+            json={"plan_id": plan["plan_id"], "plan_version": plan["plan_version"]},
+            headers=headers,
+        )
         assert unconfirmed.status_code == 409
         assert fake_graph.inputs == []
 
-        confirmed = client.post(f"/plans/{plan['plan_id']}/versions/1/confirm")
+        confirmed = client.post(f"/plans/{plan['plan_id']}/versions/1/confirm", headers=headers)
         assert confirmed.status_code == 200
         assert confirmed.json()["status"] == "confirmed"
 
-        first_run = client.post("/runs", json={"plan_id": plan["plan_id"], "plan_version": 1})
+        first_run = client.post(
+            "/runs",
+            json={"plan_id": plan["plan_id"], "plan_version": 1},
+            headers=headers,
+        )
         assert first_run.status_code == 200
         run = first_run.json()
         task_id = run["plan"]["tasks"][0]["task_id"]
         assert run["run"]["status"] == "failed"
         assert len(run["report_versions"]) == 1
 
-        retried = client.post(f"/runs/{run['run']['run_id']}/tasks/{task_id}/retry")
+        retried = client.post(f"/runs/{run['run']['run_id']}/tasks/{task_id}/retry", headers=headers)
         assert retried.status_code == 200
         assert retried.json()["run"]["status"] == "succeeded"
         assert retried.json()["task_runs"][0]["attempt"] == 2
@@ -212,8 +228,9 @@ def test_plan_confirmation_api_blocks_execution_until_confirmed_and_retries_fail
 
 
 class FakeResumeGraph:
-    def __init__(self, repository):
+    def __init__(self, repository, owner_id):
         self.repository = repository
+        self.owner_id = owner_id
         self.invocations = []
 
     def get_state(self, _config):
@@ -223,7 +240,7 @@ class FakeResumeGraph:
         self.invocations.append((state, config))
         assert state is None
         run_id = config["configurable"]["thread_id"]
-        persisted = self.repository.get_run(run_id)
+        persisted = self.repository.get_run(run_id, owner_id=self.owner_id)
         run = dict(persisted["run"])
         run["status"] = RunStatus.SUCCEEDED.value
         task = persisted["plan"]["tasks"][0]
@@ -255,12 +272,6 @@ class FakeResumeGraph:
 
 def test_resume_uses_existing_checkpoint_and_cancel_is_terminal(tmp_path):
     repository = SQLiteRepository(tmp_path / "resume-cancel.db")
-    plan_record = repository.create_plan(_plan())
-    repository.confirm_plan(plan_record["plan"]["plan_id"], 1)
-    created = repository.create_run(plan_record["plan"]["plan_id"], 1)
-    run_id = created["run"]["run_id"]
-    repository.mark_run_running(run_id)
-    fake_graph = FakeResumeGraph(repository)
     app = main.create_app(
         repository=repository,
         graph_factory=lambda **_kwargs: fake_graph,
@@ -268,14 +279,21 @@ def test_resume_uses_existing_checkpoint_and_cancel_is_terminal(tmp_path):
     )
 
     with TestClient(app) as client:
-        resumed = client.post(f"/runs/{run_id}/resume")
+        headers, owner_id = _register(client, "resume_user")
+        plan_record = repository.create_plan(_plan(), owner_id=owner_id)
+        repository.confirm_plan(plan_record["plan"]["plan_id"], 1, owner_id=owner_id)
+        created = repository.create_run(plan_record["plan"]["plan_id"], 1, owner_id=owner_id)
+        run_id = created["run"]["run_id"]
+        repository.mark_run_running(run_id, owner_id=owner_id)
+        fake_graph = FakeResumeGraph(repository, owner_id)
+        resumed = client.post(f"/runs/{run_id}/resume", headers=headers)
         assert resumed.status_code == 200
         assert resumed.json()["run"]["status"] == RunStatus.SUCCEEDED.value
         assert fake_graph.invocations[0][0] is None
         assert fake_graph.invocations[0][1]["configurable"]["thread_id"] == run_id
 
-        next_run = repository.create_run(plan_record["plan"]["plan_id"], 1)
-        cancelled = client.post(f"/runs/{next_run['run']['run_id']}/cancel")
+        next_run = repository.create_run(plan_record["plan"]["plan_id"], 1, owner_id=owner_id)
+        cancelled = client.post(f"/runs/{next_run['run']['run_id']}/cancel", headers=headers)
         assert cancelled.status_code == 200
         assert cancelled.json()["run"]["status"] == RunStatus.CANCELLED.value
         assert cancelled.json()["task_runs"][0]["status"] == TaskStatus.CANCELLED.value
@@ -284,9 +302,10 @@ def test_resume_uses_existing_checkpoint_and_cancel_is_terminal(tmp_path):
         discarded = repository.persist_graph_result(
             next_run["run"]["run_id"],
             _failed_graph_result(next_run["run"], next_run["plan"]),
+            owner_id=owner_id,
         )
         assert discarded["run"]["status"] == RunStatus.CANCELLED.value
         assert discarded["report_versions"] == []
-        assert client.post(f"/runs/{next_run['run']['run_id']}/resume").status_code == 409
+        assert client.post(f"/runs/{next_run['run']['run_id']}/resume", headers=headers).status_code == 409
 
     repository.close()

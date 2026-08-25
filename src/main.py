@@ -1,19 +1,24 @@
 """FastAPI entry point for LangGraph Deep Research"""
 
-import json
 import sys
-import os
-from pathlib import Path
-from datetime import datetime
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
 
 from src.config import get_config
+from src.auth import (
+    CredentialRequest,
+    CurrentUser,
+    TokenResponse,
+    create_access_token,
+    hash_password,
+    require_current_user,
+    verify_password,
+)
 from src.budget import budget_from_config
 from src.graph.research import _safe_error_message, create_research_graph, get_research_graph
 from src.memory.long_term import create_long_term_memory, search_long_term_memory
@@ -37,11 +42,6 @@ logger.add(
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <4}</level> | <level>{message}</level>",
     colorize=True,
 )
-
-# 历史记录存储目录（使用绝对路径，基于项目根目录）
-HISTORY_DIR = Path(__file__).parent.parent / "research_history"
-HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-
 
 class ResearchRequest(BaseModel):
     """研究请求"""
@@ -91,52 +91,18 @@ class RunCreateRequest(BaseModel):
     plan_version: int = Field(..., ge=1)
 
 
-def _save_history(topic: str, report: str, tasks: List[dict]) -> str:
-    """保存研究历史到文件"""
-    import time
-    history_id = f"research_{int(time.time() * 1000)}"
-    history_data = {
-        "id": history_id,
-        "topic": topic,
-        "report": report,
-        "tasks": tasks,
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def _history_detail(run_record: dict[str, Any]) -> dict[str, Any]:
+    """Adapt an owned persisted run to the frontend's existing history contract."""
+
+    reports = run_record.get("report_versions") or []
+    latest_report = reports[-1] if reports else {}
+    return {
+        "id": run_record["run"]["run_id"],
+        "topic": run_record["run"]["topic"],
+        "report": latest_report.get("markdown", ""),
+        "tasks": run_record.get("plan", {}).get("tasks", []),
+        "created_at": run_record["run"].get("created_at", ""),
     }
-    file_path = HISTORY_DIR / f"{history_id}.json"
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(history_data, f, ensure_ascii=False, indent=2)
-    return history_id
-
-
-def _get_history_list() -> List[dict]:
-    """获取历史记录列表"""
-    history_list = []
-    for file_path in HISTORY_DIR.glob("*.json"):
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                history_list.append({
-                    "id": data.get("id"),
-                    "topic": data.get("topic"),
-                    "created_at": data.get("created_at")
-                })
-        except Exception:
-            continue
-    # 按时间倒序排列
-    history_list.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    return history_list
-
-
-def _get_history(history_id: str) -> Optional[dict]:
-    """获取单条历史记录"""
-    file_path = HISTORY_DIR / f"{history_id}.json"
-    if not file_path.exists():
-        return None
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
 
 
 def _create_plan_only(topic: str) -> dict:
@@ -221,12 +187,17 @@ def _execute_persisted_run(
     graph_factory: Callable[..., Any],
     run_id: str,
     *,
+    owner_id: str,
     retry_task_id: str | None = None,
     resume: bool = False,
 ) -> dict[str, Any]:
     """Execute or resume a confirmed run, persisting final graph artifacts atomically afterwards."""
-    state = repository.prepare_task_retry(run_id, retry_task_id) if retry_task_id else repository.execution_state(run_id)
-    repository.mark_run_running(run_id)
+    state = (
+        repository.prepare_task_retry(run_id, retry_task_id, owner_id=owner_id)
+        if retry_task_id
+        else repository.execution_state(run_id, owner_id=owner_id)
+    )
+    repository.mark_run_running(run_id, owner_id=owner_id)
     publisher = EventPublisher(repository, run_id)
     register_publisher(publisher)
     try:
@@ -243,7 +214,7 @@ def _execute_persisted_run(
         result = graph.invoke(graph_input, config=config)
         if not isinstance(result, dict):
             raise RepositoryError("research graph must return a dictionary state")
-        return repository.persist_graph_result(run_id, result)
+        return repository.persist_graph_result(run_id, result, owner_id=owner_id)
     except Exception as error:
         publisher.publish(
             EventType.FAILED,
@@ -325,10 +296,37 @@ def create_app(
     def health_check() -> Dict[str, str]:
         return {"status": "ok"}
 
-    @app.post("/plans")
-    def create_persisted_plan(payload: ResearchRequest) -> dict[str, Any]:
+    @app.post("/auth/register", response_model=TokenResponse, status_code=201)
+    def register(payload: CredentialRequest) -> TokenResponse:
+        repository_instance = active_repository()
+        if repository_instance.get_user_by_username(payload.username) is not None:
+            raise HTTPException(status_code=409, detail="username already exists")
         try:
-            return active_repository().create_plan(_generate_valid_plan(payload.topic))
+            created = repository_instance.create_user(payload.username, hash_password(payload.password))
+        except RepositoryError as error:
+            raise _repository_http_error(error) from error
+        user = CurrentUser(user_id=created["user_id"], username=created["username"])
+        return TokenResponse(access_token=create_access_token(user, get_config().auth), user=user)
+
+    @app.post("/auth/login", response_model=TokenResponse)
+    def login(payload: CredentialRequest) -> TokenResponse:
+        user = active_repository().get_user_by_username(payload.username)
+        if user is None or not verify_password(payload.password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="invalid username or password")
+        current_user = CurrentUser(user_id=user["user_id"], username=user["username"])
+        return TokenResponse(access_token=create_access_token(current_user, get_config().auth), user=current_user)
+
+    @app.get("/auth/me", response_model=CurrentUser)
+    def current_identity(current_user: CurrentUser = Depends(require_current_user)) -> CurrentUser:
+        return current_user
+
+    @app.post("/plans")
+    def create_persisted_plan(
+        payload: ResearchRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, Any]:
+        try:
+            return active_repository().create_plan(_generate_valid_plan(payload.topic), owner_id=current_user.user_id)
         except RepositoryError as error:
             raise _repository_http_error(error) from error
         except Exception as error:
@@ -336,47 +334,78 @@ def create_app(
             raise HTTPException(status_code=500, detail=str(error)) from error
 
     @app.get("/plans/{plan_id}/versions/{plan_version}")
-    def get_persisted_plan(plan_id: str, plan_version: int) -> dict[str, Any]:
+    def get_persisted_plan(
+        plan_id: str,
+        plan_version: int,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, Any]:
         try:
-            return active_repository().get_plan(plan_id, plan_version)
+            return active_repository().get_plan(plan_id, plan_version, owner_id=current_user.user_id)
         except RepositoryError as error:
             raise _repository_http_error(error) from error
 
     @app.put("/plans/{plan_id}/versions/{plan_version}")
-    def update_persisted_plan(plan_id: str, plan_version: int, payload: PlanUpdateRequest) -> dict[str, Any]:
+    def update_persisted_plan(
+        plan_id: str,
+        plan_version: int,
+        payload: PlanUpdateRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, Any]:
         try:
             repository_instance = active_repository()
-            current = repository_instance.get_plan(plan_id, plan_version)
-            return repository_instance.update_plan(plan_id, plan_version, _edited_plan(current, payload))
+            current = repository_instance.get_plan(plan_id, plan_version, owner_id=current_user.user_id)
+            return repository_instance.update_plan(
+                plan_id,
+                plan_version,
+                _edited_plan(current, payload),
+                owner_id=current_user.user_id,
+            )
         except RepositoryError as error:
             raise _repository_http_error(error) from error
         except Exception as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.post("/plans/{plan_id}/versions/{plan_version}/confirm")
-    def confirm_persisted_plan(plan_id: str, plan_version: int) -> dict[str, Any]:
+    def confirm_persisted_plan(
+        plan_id: str,
+        plan_version: int,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, Any]:
         try:
-            return active_repository().confirm_plan(plan_id, plan_version)
+            return active_repository().confirm_plan(plan_id, plan_version, owner_id=current_user.user_id)
         except RepositoryError as error:
             raise _repository_http_error(error) from error
 
     @app.post("/plans/{plan_id}/versions/{plan_version}/cancel")
-    def cancel_persisted_plan(plan_id: str, plan_version: int) -> dict[str, Any]:
+    def cancel_persisted_plan(
+        plan_id: str,
+        plan_version: int,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, Any]:
         try:
-            return active_repository().cancel_plan(plan_id, plan_version)
+            return active_repository().cancel_plan(plan_id, plan_version, owner_id=current_user.user_id)
         except RepositoryError as error:
             raise _repository_http_error(error) from error
 
     @app.post("/runs")
-    def create_persisted_run(payload: RunCreateRequest) -> dict[str, Any]:
+    def create_persisted_run(
+        payload: RunCreateRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, Any]:
         try:
             repository_instance = active_repository()
             run = repository_instance.create_run(
                 payload.plan_id,
                 payload.plan_version,
+                owner_id=current_user.user_id,
                 budget=budget_from_config(get_config()),
             )
-            return _execute_persisted_run(repository_instance, graph_factory, run["run"]["run_id"])
+            return _execute_persisted_run(
+                repository_instance,
+                graph_factory,
+                run["run"]["run_id"],
+                owner_id=current_user.user_id,
+            )
         except RepositoryError as error:
             raise _repository_http_error(error) from error
         except Exception as error:
@@ -384,9 +413,14 @@ def create_app(
             raise HTTPException(status_code=500, detail=str(error)) from error
 
     @app.post("/runs/{run_id}/resume")
-    def resume_persisted_run(run_id: str) -> dict[str, Any]:
+    def resume_persisted_run(
+        run_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, Any]:
         try:
-            return _execute_persisted_run(active_repository(), graph_factory, run_id, resume=True)
+            return _execute_persisted_run(
+                active_repository(), graph_factory, run_id, owner_id=current_user.user_id, resume=True
+            )
         except RepositoryError as error:
             raise _repository_http_error(error) from error
         except Exception as error:
@@ -394,10 +428,18 @@ def create_app(
             raise HTTPException(status_code=500, detail=str(error)) from error
 
     @app.post("/runs/{run_id}/tasks/{task_id}/retry")
-    def retry_persisted_task(run_id: str, task_id: str) -> dict[str, Any]:
+    def retry_persisted_task(
+        run_id: str,
+        task_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, Any]:
         try:
             return _execute_persisted_run(
-                active_repository(), graph_factory, run_id, retry_task_id=task_id
+                active_repository(),
+                graph_factory,
+                run_id,
+                owner_id=current_user.user_id,
+                retry_task_id=task_id,
             )
         except RepositoryError as error:
             raise _repository_http_error(error) from error
@@ -406,32 +448,49 @@ def create_app(
             raise HTTPException(status_code=500, detail=str(error)) from error
 
     @app.post("/runs/{run_id}/cancel")
-    def cancel_persisted_run(run_id: str) -> dict[str, Any]:
+    def cancel_persisted_run(
+        run_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, Any]:
         try:
-            return active_repository().cancel_run(run_id)
+            return active_repository().cancel_run(run_id, owner_id=current_user.user_id)
         except RepositoryError as error:
             raise _repository_http_error(error) from error
 
     @app.get("/runs/{run_id}")
-    def get_persisted_run(run_id: str) -> dict[str, Any]:
+    def get_persisted_run(
+        run_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> dict[str, Any]:
         try:
-            return active_repository().get_run(run_id)
+            return active_repository().get_run(run_id, owner_id=current_user.user_id)
         except RepositoryError as error:
             raise _repository_http_error(error) from error
 
     @app.post("/research", response_model=ResearchResponse)
-    def run_research(payload: ResearchRequest) -> ResearchResponse:
+    def run_research(
+        payload: ResearchRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> ResearchResponse:
         """同步执行研究"""
         try:
             repository_instance = active_repository()
-            plan = repository_instance.create_plan(_generate_valid_plan(payload.topic))
-            repository_instance.confirm_plan(plan["plan"]["plan_id"], plan["plan"]["plan_version"])
+            plan = repository_instance.create_plan(_generate_valid_plan(payload.topic), owner_id=current_user.user_id)
+            repository_instance.confirm_plan(
+                plan["plan"]["plan_id"], plan["plan"]["plan_version"], owner_id=current_user.user_id
+            )
             created_run = repository_instance.create_run(
                 plan["plan"]["plan_id"],
                 plan["plan"]["plan_version"],
+                owner_id=current_user.user_id,
                 budget=budget_from_config(get_config()),
             )
-            result = _execute_persisted_run(repository_instance, graph_factory, created_run["run"]["run_id"])
+            result = _execute_persisted_run(
+                repository_instance,
+                graph_factory,
+                created_run["run"]["run_id"],
+                owner_id=current_user.user_id,
+            )
         except Exception as exc:
             logger.exception("Research failed")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -440,32 +499,32 @@ def create_app(
         report = str(reports[-1].get("markdown") or "") if reports else ""
         tasks = result.get("plan", {}).get("tasks", [])
 
-        # 保存到历史记录
-        _save_history(payload.topic, report, tasks)
-
         return ResearchResponse(
             report_markdown=report,
             todo_items=tasks,
         )
 
     @app.get("/history", response_model=List[dict])
-    def get_history():
-        """获取历史研究列表"""
-        logger.info(f"HISTORY_DIR: {HISTORY_DIR}, exists: {HISTORY_DIR.exists()}")
-        result = _get_history_list()
-        logger.info(f"History list: {result}")
-        return result
+    def get_history(current_user: CurrentUser = Depends(require_current_user)):
+        """Return only the current user's durable research history."""
+        return active_repository().list_runs(owner_id=current_user.user_id)
 
     @app.get("/history/{history_id}")
-    def get_history_detail(history_id: str):
-        """获取历史研究详情"""
-        history = _get_history(history_id)
-        if not history:
-            raise HTTPException(status_code=404, detail="历史记录不存在")
-        return history
+    def get_history_detail(
+        history_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ):
+        """Return one owned durable research report."""
+        try:
+            return _history_detail(active_repository().get_run(history_id, owner_id=current_user.user_id))
+        except RepositoryError as error:
+            raise _repository_http_error(error) from error
 
     @app.post("/plan", response_model=ResearchResponse)
-    def create_plan(payload: ResearchRequest) -> ResearchResponse:
+    def create_plan(
+        payload: ResearchRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> ResearchResponse:
         """只生成任务规划，不保存历史"""
         try:
             result = _create_plan_only(payload.topic)
@@ -479,21 +538,29 @@ def create_app(
         )
 
     @app.post("/research/stream")
-    def stream_research(payload: ResearchRequest) -> StreamingResponse:
+    def stream_research(
+        payload: ResearchRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ) -> StreamingResponse:
         """Execute the compatibility one-click flow and emit standard SSE events."""
+
+        owner_id = current_user.user_id
+        if payload.session_id and get_session(payload.session_id, owner_id) is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
 
         def event_iterator() -> Iterator[str]:
             repository_instance = active_repository()
             publisher: EventPublisher | None = None
             run_id = "unassigned"
             try:
-                plan = repository_instance.create_plan(_generate_valid_plan(payload.topic))
+                plan = repository_instance.create_plan(_generate_valid_plan(payload.topic), owner_id=owner_id)
                 confirmed = repository_instance.confirm_plan(
-                    plan["plan"]["plan_id"], plan["plan"]["plan_version"]
+                    plan["plan"]["plan_id"], plan["plan"]["plan_version"], owner_id=owner_id
                 )
                 created = repository_instance.create_run(
                     confirmed["plan"]["plan_id"],
                     confirmed["plan"]["plan_version"],
+                    owner_id=owner_id,
                     budget=budget_from_config(get_config()),
                 )
                 run_id = created["run"]["run_id"]
@@ -504,8 +571,8 @@ def create_app(
                     payload={"plan_version": confirmed["plan"]["plan_version"]},
                     persist=False,
                 )
-                repository_instance.mark_run_running(run_id)
-                state = repository_instance.execution_state(run_id)
+                repository_instance.mark_run_running(run_id, owner_id=owner_id)
+                state = repository_instance.execution_state(run_id, owner_id=owner_id)
                 if payload.session_id:
                     state["session_id"] = payload.session_id
                 metadata = _trace_metadata(state["run"], session_id=payload.session_id)
@@ -520,19 +587,20 @@ def create_app(
                         yield encode_sse(event)
                 if final_state is None:
                     raise RepositoryError("research graph produced no final state")
-                result = repository_instance.persist_graph_result(run_id, final_state)
+                result = repository_instance.persist_graph_result(run_id, final_state, owner_id=owner_id)
                 for event in publisher.drain():
                     yield encode_sse(event)
                 reports = result.get("report_versions") or []
                 report = str(reports[-1].get("markdown") or "") if reports else ""
-                if payload.session_id and get_session(payload.session_id):
-                    session = get_session(payload.session_id)
+                if payload.session_id and get_session(payload.session_id, owner_id):
+                    session = get_session(payload.session_id, owner_id)
                     session.current_topic = payload.topic
                     session.last_report = report
                     session.last_tasks = result.get("plan", {}).get("tasks", [])
-                    add_message(payload.session_id, ChatMessage(role="user", content=payload.topic))
+                    add_message(payload.session_id, owner_id, ChatMessage(role="user", content=payload.topic))
                     add_message(
                         payload.session_id,
+                        owner_id,
                         ChatMessage(
                             role="assistant",
                             content=report,
@@ -579,16 +647,16 @@ def create_app(
         )
 
     @app.post("/sessions", response_model=SessionState)
-    def api_create_session():
+    def api_create_session(current_user: CurrentUser = Depends(require_current_user)):
         """Create a new chat session"""
-        session = create_session()
+        session = create_session(current_user.user_id)
 
         # Create per-session short-term memory
         config = get_config()
         from src.llm import create_llm
         llm = create_llm()
         memory = create_short_term_memory(llm, config.memory.short_term_max_tokens)
-        set_session_memory(session.id, memory)
+        set_session_memory(session.id, current_user.user_id, memory)
 
         # Add welcome message
         welcome = ChatMessage(
@@ -600,14 +668,19 @@ def create_app(
                     "请问你想研究什么？",
             message_type="text",
         )
-        add_message(session.id, welcome)
+        add_message(session.id, current_user.user_id, welcome)
 
-        return get_session(session.id)
+        return get_session(session.id, current_user.user_id)
 
     @app.post("/sessions/{session_id}/chat", response_model=ChatResponse)
-    def api_chat(session_id: str, payload: ChatRequest):
+    def api_chat(
+        session_id: str,
+        payload: ChatRequest,
+        current_user: CurrentUser = Depends(require_current_user),
+    ):
         """Send a message in a chat session"""
-        session = get_session(session_id)
+        owner_id = current_user.user_id
+        session = get_session(session_id, owner_id)
         if not session:
             raise HTTPException(status_code=404, detail="会话不存在")
 
@@ -616,10 +689,10 @@ def create_app(
             raise HTTPException(status_code=400, detail="消息不能为空")
 
         # Add user message to session
-        add_message(session_id, ChatMessage(role="user", content=user_msg))
+        add_message(session_id, owner_id, ChatMessage(role="user", content=user_msg))
 
         # Save to session's short-term memory
-        session_mem = get_session_memory(session_id)
+        session_mem = get_session_memory(session_id, owner_id)
 
         # Create LLM
         from src.llm import create_llm
@@ -646,6 +719,7 @@ def create_app(
                 result = graph.invoke({
                     "topic": user_msg,
                     "session_id": session_id,
+                    "owner_id": owner_id,
                 })
 
                 report = result.get("report", "研究完成，但未能生成报告。")
@@ -663,16 +737,13 @@ def create_app(
                 session.last_report = report
                 session.last_tasks = tasks
 
-                # Save to history
-                _save_history(user_msg, report, tasks)
-
                 ai_msg = ChatMessage(
                     role="assistant",
                     content=report,
                     message_type="research_report",
                     tasks=tasks,
                 )
-                add_message(session_id, ai_msg)
+                add_message(session_id, owner_id, ai_msg)
 
                 return ChatResponse(
                     reply=report,
@@ -691,7 +762,7 @@ def create_app(
                         pass
 
                 ai_msg = ChatMessage(role="assistant", content=reply, message_type="text")
-                add_message(session_id, ai_msg)
+                add_message(session_id, owner_id, ai_msg)
 
                 return ChatResponse(reply=reply, message_type="text")
 
@@ -702,6 +773,7 @@ def create_app(
                 result = graph.invoke({
                     "topic": combined_topic,
                     "session_id": session_id,
+                    "owner_id": owner_id,
                 })
 
                 report = result.get("report", "研究完成，但未能生成报告。")
@@ -716,15 +788,13 @@ def create_app(
                 session.last_report = report
                 session.last_tasks = tasks
 
-                _save_history(f"{session.current_topic} (refined)", report, tasks)
-
                 ai_msg = ChatMessage(
                     role="assistant",
                     content=report,
                     message_type="research_report",
                     tasks=tasks,
                 )
-                add_message(session_id, ai_msg)
+                add_message(session_id, owner_id, ai_msg)
 
                 return ChatResponse(
                     reply=report,
@@ -742,7 +812,7 @@ def create_app(
                         pass
 
                 ai_msg = ChatMessage(role="assistant", content=reply, message_type="text")
-                add_message(session_id, ai_msg)
+                add_message(session_id, owner_id, ai_msg)
 
                 return ChatResponse(reply=reply, message_type="text")
 
@@ -750,23 +820,29 @@ def create_app(
             logger.exception(f"Chat processing failed for session {session_id}")
             error_reply = f"处理消息时出错：{str(exc)}"
             ai_msg = ChatMessage(role="assistant", content=error_reply, message_type="text")
-            add_message(session_id, ai_msg)
+            add_message(session_id, owner_id, ai_msg)
             return ChatResponse(reply=error_reply, message_type="text")
 
     @app.get("/sessions/{session_id}", response_model=SessionState)
-    def api_get_session(session_id: str):
+    def api_get_session(
+        session_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ):
         """Get session history"""
-        session = get_session(session_id)
+        session = get_session(session_id, current_user.user_id)
         if not session:
             raise HTTPException(status_code=404, detail="会话不存在")
         return session
 
     @app.delete("/sessions/{session_id}")
-    def api_delete_session(session_id: str):
+    def api_delete_session(
+        session_id: str,
+        current_user: CurrentUser = Depends(require_current_user),
+    ):
         """Delete a session"""
-        if not get_session(session_id):
+        if not get_session(session_id, current_user.user_id):
             raise HTTPException(status_code=404, detail="会话不存在")
-        delete_session(session_id)
+        delete_session(session_id, current_user.user_id)
         return {"status": "ok"}
 
     return app

@@ -128,7 +128,7 @@ class AuthConfig(BaseModel):
     """Authentication settings. The development default is rejected in production."""
 
     environment: str = Field(default="development", min_length=1, max_length=32)
-    jwt_secret: str = Field(default="development-only-change-me", min_length=16)
+    jwt_secret: str = Field(default="development-only-change-me-32-bytes", min_length=32)
     jwt_algorithm: str = Field(default="HS256", min_length=1, max_length=32)
     access_token_minutes: int = Field(default=480, ge=1, le=43_200)
 
@@ -264,9 +264,11 @@ class Config(BaseSettings):
         configured_jwt_secret = os.getenv("AUTH_JWT_SECRET", "").strip()
         development_jwt_secret = AuthConfig.model_fields["jwt_secret"].default
         if environment in {"production", "prod"} and (
-            not configured_jwt_secret or configured_jwt_secret == development_jwt_secret
+            not configured_jwt_secret
+            or configured_jwt_secret == development_jwt_secret
+            or len(configured_jwt_secret) < 32
         ):
-            raise ValueError("AUTH_JWT_SECRET must be set to a non-development value in production")
+            raise ValueError("AUTH_JWT_SECRET must be a non-development value of at least 32 characters in production")
 
         return cls(
             search=SearchConfig(

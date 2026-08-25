@@ -364,6 +364,7 @@ class ResearchState(TypedDict, total=False):
     report: str
     report_artifact: dict[str, Any]
     document_scope: dict[str, Any]
+    owner_id: str
     confirmed_plan: bool
     retry_task_id: Optional[str]
     loop_count: int

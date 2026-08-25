@@ -92,12 +92,12 @@ def test_production_rejects_missing_or_development_jwt_secret(monkeypatch):
     with pytest.raises(ValueError, match="AUTH_JWT_SECRET"):
         Config.from_env()
 
-    monkeypatch.setenv("AUTH_JWT_SECRET", "development-only-change-me")
+    monkeypatch.setenv("AUTH_JWT_SECRET", "development-only-change-me-32-bytes")
     with pytest.raises(ValueError, match="AUTH_JWT_SECRET"):
         Config.from_env()
 
-    monkeypatch.setenv("AUTH_JWT_SECRET", "a-strong-production-secret")
-    assert Config.from_env().auth.jwt_secret == "a-strong-production-secret"
+    monkeypatch.setenv("AUTH_JWT_SECRET", "a-strong-production-secret-that-is-long-enough")
+    assert Config.from_env().auth.jwt_secret == "a-strong-production-secret-that-is-long-enough"
 
 
 def test_vlm_does_not_inherit_the_text_generation_model(monkeypatch):

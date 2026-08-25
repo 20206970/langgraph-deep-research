@@ -218,6 +218,8 @@ def _new_run(
     status: RunStatus,
     llm: Any = None,
     output_diagnostics: dict[str, dict[str, Any]] | None = None,
+    *,
+    owner_id: str = "",
 ) -> ResearchRun:
     from src.config import get_config
 
@@ -227,6 +229,7 @@ def _new_run(
         plan_version=plan.plan_version,
         topic=topic,
         status=status,
+        owner_id=owner_id,
         model_versions=model_versions(),
         prompt_versions={"planner": "p0.1", "summarizer": "p0.2", "reporter": "p0.2"},
         budget=budget_from_config(get_config()),
@@ -346,6 +349,7 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
     """Generate and validate one task plan before dispatching any search work."""
     topic = str(state.get("topic") or "").strip() or "未命名研究主题"
     session_id = state.get("session_id")
+    owner_id = str(state.get("owner_id") or (state.get("run") or {}).get("owner_id") or "")
     llm = None
     output = ""
     emit_event(state, EventType.PLANNING, payload={"status": "started"})
@@ -376,7 +380,7 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
             }
         except Exception as error:
             plan = _build_rejected_plan(topic, StructuredOutputError("CONFIRMED_PLAN_INVALID", _safe_error_message(error)))
-            run = _new_run(topic, session_id, plan, RunStatus.FAILED)
+            run = _new_run(topic, session_id, plan, RunStatus.FAILED, owner_id=owner_id)
             plan_payload = plan.model_dump(mode="json")
             emit_event(
                 state,
@@ -399,7 +403,7 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
             from src.session import get_session_memory
 
             long_mem = get_long_term_memory()
-            short_mem = get_session_memory(session_id) if session_id else get_short_term_memory(llm)
+            short_mem = get_session_memory(session_id, owner_id) if session_id else get_short_term_memory(llm)
             context = get_memory_context(short_mem) if short_mem else ""
             long_context = "\n".join(search_long_term_memory(topic, long_mem) if long_mem else [])
         except Exception:
@@ -433,6 +437,7 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
             RunStatus.RUNNING,
             llm,
             {"planner": _output_diagnostic(output, plan.parse_status)},
+            owner_id=owner_id,
         )
     except StructuredOutputError as error:
         plan = _build_rejected_plan(topic, error)
@@ -443,6 +448,7 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
             RunStatus.FAILED,
             llm,
             {"planner": _output_diagnostic(output, ParseStatus.REJECTED, error.code)},
+            owner_id=owner_id,
         )
     except Exception as error:
         structured_error = StructuredOutputError("PLANNER_EXECUTION_FAILED", _safe_error_message(error))
@@ -454,6 +460,7 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
             RunStatus.FAILED,
             llm,
             {"planner": _output_diagnostic(output, ParseStatus.REJECTED, structured_error.code)},
+            owner_id=owner_id,
         )
 
     plan_payload = plan.model_dump(mode="json")
@@ -1027,6 +1034,7 @@ def _updated_run(
             plan_version=plan.get("plan_version"),
             topic=str(state.get("topic") or "未命名研究主题"),
             status=status,
+            owner_id=str(state.get("owner_id") or ""),
             budget_usage=budget_usage or _budget_usage(state),
             output_diagnostics=output_diagnostics,
         )
@@ -1122,7 +1130,7 @@ def reporter_node(state: dict[str, Any]) -> dict[str, Any]:
             from src.memory.short_term import add_to_short_term_memory
             from src.session import get_session_memory
 
-            session_mem = get_session_memory(session_id)
+            session_mem = get_session_memory(session_id, str(state.get("owner_id") or ""))
             if session_mem:
                 add_to_short_term_memory(
                     session_mem,

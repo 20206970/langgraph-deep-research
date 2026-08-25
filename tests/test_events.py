@@ -18,6 +18,13 @@ def _plan(topic="stream topic"):
     )
 
 
+def _register(client: TestClient, username: str = "stream_user") -> tuple[dict[str, str], str]:
+    response = client.post("/auth/register", json={"username": username, "password": "correct-horse-42"})
+    assert response.status_code == 201
+    payload = response.json()
+    return {"Authorization": f"Bearer {payload['access_token']}"}, payload["user"]["user_id"]
+
+
 def test_event_redaction_and_sse_encoding():
     payload = redact_payload(
         {
@@ -128,7 +135,8 @@ def test_stream_endpoint_emits_standard_sse_and_persists_event(tmp_path, monkeyp
     )
 
     with TestClient(app) as client:
-        response = client.post("/research/stream", json={"topic": "stream topic"})
+        headers, owner_id = _register(client)
+        response = client.post("/research/stream", json={"topic": "stream topic"}, headers=headers)
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
@@ -138,5 +146,8 @@ def test_stream_endpoint_emits_standard_sse_and_persists_event(tmp_path, monkeyp
     assert "# Stream report" in response.text
     assert "data: {\"topic\"" not in response.text
     assert fake_graph.config["configurable"]["thread_id"] == fake_graph.run_id
-    assert any(event.type == EventType.PLAN_CONFIRMED for event in repository.list_events(fake_graph.run_id))
+    assert any(
+        event.type == EventType.PLAN_CONFIRMED
+        for event in repository.list_events(fake_graph.run_id, owner_id=owner_id)
+    )
     repository.close()
