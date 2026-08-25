@@ -124,6 +124,74 @@ class TracingConfig(BaseModel):
     redact_patterns: list[str] = Field(default_factory=list)
 
 
+class AuthConfig(BaseModel):
+    """Authentication settings. The development default is rejected in production."""
+
+    environment: str = Field(default="development", min_length=1, max_length=32)
+    jwt_secret: str = Field(default="development-only-change-me", min_length=16)
+    jwt_algorithm: str = Field(default="HS256", min_length=1, max_length=32)
+    access_token_minutes: int = Field(default=480, ge=1, le=43_200)
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment.lower() in {"production", "prod"}
+
+
+class DocumentConfig(BaseModel):
+    """Private document storage, ingestion, and chunking settings."""
+
+    storage_root: str = Field(default="./document_data", min_length=1)
+    chroma_persist_dir: str = Field(default="./chroma_data_documents", min_length=1)
+    chroma_collection: str = Field(default="user_documents", min_length=1, max_length=128)
+    max_file_bytes: int = Field(default=50 * 1024 * 1024, ge=1)
+    user_quota_bytes: int = Field(default=500 * 1024 * 1024, ge=1)
+    job_lease_seconds: int = Field(default=600, ge=1)
+    job_max_attempts: int = Field(default=3, ge=1, le=10)
+    purge_retention_days: int = Field(default=30, ge=1, le=365)
+    converter: str = Field(default="docling", min_length=1, max_length=64)
+    docling_ocr_enabled: bool = False
+    markitdown_fallback_enabled: bool = True
+    stage_timeout_seconds: int = Field(default=600, ge=1)
+    parent_target_tokens: int = Field(default=500, ge=400, le=600)
+    child_overlap_ratio: float = Field(default=0.12, ge=0.10, le=0.15)
+
+
+class DocumentVLMConfig(BaseModel):
+    """Optional vision model configuration, isolated from text generation settings."""
+
+    provider: str = Field(default="", max_length=64)
+    api_key: str = Field(default="")
+    base_url: str = Field(default="")
+    model: str = Field(default="", max_length=256)
+    max_tokens: int = Field(default=1_024, ge=1, le=16_384)
+    timeout_seconds: int = Field(default=60, ge=1, le=3_600)
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.provider.strip() and self.model.strip())
+
+
+class RerankerConfig(BaseModel):
+    """Parent-chunk reranker settings independent from the embeddings model."""
+
+    provider: str = Field(default="flagembedding", min_length=1, max_length=64)
+    model: str = Field(default="BAAI/bge-reranker-v2-m3", min_length=1, max_length=256)
+    device: str = Field(default="auto", min_length=1, max_length=64)
+    batch_size: int = Field(default=4, ge=1, le=256)
+    max_length: int = Field(default=512, ge=1, le=8_192)
+    top_k: int = Field(default=8, ge=1, le=100)
+
+
+class DocumentRetrievalConfig(BaseModel):
+    """Candidate and fusion bounds for user-document retrieval."""
+
+    vector_top_k: int = Field(default=30, ge=1, le=200)
+    bm25_top_k: int = Field(default=30, ge=1, le=200)
+    rrf_k: int = Field(default=60, ge=1, le=1_000)
+    parent_candidate_k: int = Field(default=16, ge=1, le=100)
+    neighbor_window: int = Field(default=1, ge=0, le=5)
+
+
 class Config(BaseSettings):
     """Main configuration"""
     search: SearchConfig = Field(default_factory=SearchConfig)
@@ -135,6 +203,11 @@ class Config(BaseSettings):
     routing: ModelRoutingConfig = Field(default_factory=ModelRoutingConfig)
     search_cache: SearchCacheConfig = Field(default_factory=SearchCacheConfig)
     budget: RunBudgetConfig = Field(default_factory=RunBudgetConfig)
+    auth: AuthConfig = Field(default_factory=AuthConfig)
+    documents: DocumentConfig = Field(default_factory=DocumentConfig)
+    document_vlm: DocumentVLMConfig = Field(default_factory=DocumentVLMConfig)
+    reranker: RerankerConfig = Field(default_factory=RerankerConfig)
+    document_retrieval: DocumentRetrievalConfig = Field(default_factory=DocumentRetrievalConfig)
 
     class Config:
         env_prefix = ""
@@ -180,6 +253,20 @@ class Config(BaseSettings):
         def optional_float(name: str) -> float | None:
             value = os.getenv(name, "").strip()
             return float(value) if value and value != "0" else None
+
+        def env_bool(name: str, default: bool) -> bool:
+            value = os.getenv(name)
+            if value is None:
+                return default
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+
+        environment = os.getenv("APP_ENV", "development").strip().lower() or "development"
+        configured_jwt_secret = os.getenv("AUTH_JWT_SECRET", "").strip()
+        development_jwt_secret = AuthConfig.model_fields["jwt_secret"].default
+        if environment in {"production", "prod"} and (
+            not configured_jwt_secret or configured_jwt_secret == development_jwt_secret
+        ):
+            raise ValueError("AUTH_JWT_SECRET must be set to a non-development value in production")
 
         return cls(
             search=SearchConfig(
@@ -255,6 +342,51 @@ class Config(BaseSettings):
                 max_total_tokens=optional_int("RUN_MAX_TOTAL_TOKENS"),
                 max_estimated_cost=optional_float("RUN_MAX_ESTIMATED_COST"),
                 max_elapsed_seconds=int(os.getenv("RUN_MAX_ELAPSED_SECONDS", "300")),
+            ),
+            auth=AuthConfig(
+                environment=environment,
+                jwt_secret=configured_jwt_secret or development_jwt_secret,
+                jwt_algorithm=os.getenv("AUTH_JWT_ALGORITHM", "HS256"),
+                access_token_minutes=int(os.getenv("AUTH_ACCESS_TOKEN_MINUTES", "480")),
+            ),
+            documents=DocumentConfig(
+                storage_root=os.getenv("DOCUMENT_STORAGE_ROOT", "./document_data"),
+                chroma_persist_dir=os.getenv("DOCUMENT_CHROMA_PERSIST_DIR", "./chroma_data_documents"),
+                chroma_collection=os.getenv("DOCUMENT_CHROMA_COLLECTION", "user_documents"),
+                max_file_bytes=int(os.getenv("DOCUMENT_MAX_FILE_BYTES", str(50 * 1024 * 1024))),
+                user_quota_bytes=int(os.getenv("DOCUMENT_USER_QUOTA_BYTES", str(500 * 1024 * 1024))),
+                job_lease_seconds=int(os.getenv("DOCUMENT_JOB_LEASE_SECONDS", "600")),
+                job_max_attempts=int(os.getenv("DOCUMENT_JOB_MAX_ATTEMPTS", "3")),
+                purge_retention_days=int(os.getenv("DOCUMENT_PURGE_RETENTION_DAYS", "30")),
+                converter=os.getenv("DOCUMENT_CONVERTER", "docling"),
+                docling_ocr_enabled=env_bool("DOCUMENT_DOCLING_OCR_ENABLED", False),
+                markitdown_fallback_enabled=env_bool("DOCUMENT_MARKITDOWN_FALLBACK_ENABLED", True),
+                stage_timeout_seconds=int(os.getenv("DOCUMENT_STAGE_TIMEOUT_SECONDS", "600")),
+                parent_target_tokens=int(os.getenv("DOCUMENT_PARENT_TARGET_TOKENS", "500")),
+                child_overlap_ratio=float(os.getenv("DOCUMENT_CHILD_OVERLAP_RATIO", "0.12")),
+            ),
+            document_vlm=DocumentVLMConfig(
+                provider=os.getenv("DOCUMENT_VLM_PROVIDER", ""),
+                api_key=os.getenv("DOCUMENT_VLM_API_KEY", ""),
+                base_url=os.getenv("DOCUMENT_VLM_BASE_URL", ""),
+                model=os.getenv("DOCUMENT_VLM_MODEL", ""),
+                max_tokens=int(os.getenv("DOCUMENT_VLM_MAX_TOKENS", "1024")),
+                timeout_seconds=int(os.getenv("DOCUMENT_VLM_TIMEOUT_SECONDS", "60")),
+            ),
+            reranker=RerankerConfig(
+                provider=os.getenv("RERANKER_PROVIDER", "flagembedding"),
+                model=os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3"),
+                device=os.getenv("RERANKER_DEVICE", "auto"),
+                batch_size=int(os.getenv("RERANKER_BATCH_SIZE", "4")),
+                max_length=int(os.getenv("RERANKER_MAX_LENGTH", "512")),
+                top_k=int(os.getenv("RERANKER_TOP_K", "8")),
+            ),
+            document_retrieval=DocumentRetrievalConfig(
+                vector_top_k=int(os.getenv("DOCUMENT_VECTOR_TOP_K", "30")),
+                bm25_top_k=int(os.getenv("DOCUMENT_BM25_TOP_K", "30")),
+                rrf_k=int(os.getenv("DOCUMENT_RRF_K", "60")),
+                parent_candidate_k=int(os.getenv("DOCUMENT_PARENT_CANDIDATE_K", "16")),
+                neighbor_window=int(os.getenv("DOCUMENT_NEIGHBOR_WINDOW", "1")),
             ),
         )
 

@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Annotated, Any, Optional, TypedDict
+from typing import Annotated, Any, Literal, Optional, TypedDict
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now() -> str:
@@ -130,6 +130,32 @@ class TaskPlan(BaseModel):
         return self
 
 
+class DocumentScope(BaseModel):
+    """Resolved document-version scope frozen when a research run is created."""
+
+    selection_mode: Literal["none", "explicit", "all_my_documents"] = "none"
+    version_ids: list[str] = Field(default_factory=list, max_length=1_000)
+    resolved_at: str = Field(default_factory=utc_now)
+
+    @field_validator("version_ids")
+    @classmethod
+    def validate_version_ids(cls, values: list[str]) -> list[str]:
+        normalized = [str(value).strip() for value in values]
+        if any(not value for value in normalized):
+            raise ValueError("document version IDs cannot be blank")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("document version IDs must be unique")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> "DocumentScope":
+        if self.selection_mode == "none" and self.version_ids:
+            raise ValueError("an empty selection cannot contain document versions")
+        if self.selection_mode == "explicit" and not self.version_ids:
+            raise ValueError("an explicit selection requires document versions")
+        return self
+
+
 class ResearchRun(BaseModel):
     """Metadata that identifies a single graph execution."""
 
@@ -140,6 +166,8 @@ class ResearchRun(BaseModel):
     plan_version: Optional[int] = Field(default=None, ge=1)
     topic: str = Field(..., min_length=1, max_length=1_000)
     status: RunStatus = RunStatus.PLANNED
+    owner_id: str = Field(default="", max_length=128)
+    document_scope: DocumentScope = Field(default_factory=DocumentScope)
     model_versions: dict[str, str] = Field(default_factory=dict)
     prompt_versions: dict[str, str] = Field(default_factory=dict)
     budget: RunBudget = Field(default_factory=RunBudget)
@@ -335,6 +363,7 @@ class ResearchState(TypedDict, total=False):
     output_diagnostics: Annotated[dict[str, dict[str, Any]], merge_output_diagnostics]
     report: str
     report_artifact: dict[str, Any]
+    document_scope: dict[str, Any]
     confirmed_plan: bool
     retry_task_id: Optional[str]
     loop_count: int
