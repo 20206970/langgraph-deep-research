@@ -1,151 +1,188 @@
-# LangGraph Deep Research Assistant
-- Tavily 搜索后端
-- FastAPI 服务接口
+# LangGraph Deep Research
 
-## 架构
+> A privacy-aware multi-agent deep research assistant built with LangGraph, featuring hybrid PDF RAG, citation tracing, and reproducible offline evaluation.
+
+面向学术调研与用户私有论文研究的多 Agent 应用。系统将研究任务拆分为规划、并行检索与摘要、报告生成，并通过结构化状态、来源引用、离线评测和文档生命周期管理控制生成过程。
+
+## Features
+
+- **可控研究工作流**：使用 LangGraph 编排 `Planner -> Summarizer -> Reporter`，支持计划确认、取消、失败恢复和单任务重试；运行状态与 checkpoint 持久化到 SQLite。
+- **私有论文工作区**：用户注册和 JWT 身份认证后，可上传 PDF 或 Markdown；文档、研究记录、检索范围和恢复操作均由服务端按用户隔离。
+- **论文解析与索引**：PDF 优先通过 Docling 解析，失败时降级至 MarkItDown；以 Markdown 二级标题为逻辑父级，结合三级标题和段落生成父子块，并保留页码和标题路径。
+- **混合检索与精排**：BGE-M3 向量检索与 SQLite FTS5 BM25 并行召回，通过 RRF 融合、物理父块聚合，再使用 `BAAI/bge-reranker-v2-m3` 精排；reranker 不可用时显式保留降级状态。
+- **来源可追溯**：研究产物使用稳定的任务、来源与结论 ID，报告引用可关联网页或用户文档的标题、页码和章节定位。
+- **可观测与可评估**：本地结构化事件和 SSE 推送任务进度；LangSmith 为可选 Trace，默认隐藏内容；固定离线快照数据集用于路由、Prompt 和流程回归比较。
+- **运行边界控制**：支持搜索 TTL 缓存、任务/重试/时长/Token/成本预算；预算耗尽和工具故障均会生成明确状态，而非伪成功结果。
+
+## Architecture
 
 ```text
-用户输入 → Planner Agent → 并行任务 → Summarizer Agent → Reporter Agent → 报告
-                ↓                              ↓
-         短期记忆（内存）              长期记忆（ChromaDB）
+Vue 3 client
+    |
+    | REST / SSE + JWT
+    v
+FastAPI ----------------------------------------------------+
+    |                                                       |
+    +--> LangGraph research flow                            +--> Document worker
+    |      Planner -> parallel Summarizer -> Reporter       |      PDF / Markdown ingestion
+    |                                                       |      Docling -> MarkItDown fallback
+    |                                                       |      chunking -> index
+    v                                                       v
+SQLite: users, plans, runs, events, FTS5           Chroma: memory and document vectors
+    |                                                       |
+    +-------------------- hybrid retrieval ----------------+
+             vector search + BM25 -> RRF -> parent reranker
 ```
 
-## 快速开始
+## Tech Stack
 
-### 1. 安装依赖
+| Area | Components |
+| --- | --- |
+| Agent and backend | Python, LangGraph, LangChain, FastAPI, Pydantic, SQLite |
+| Retrieval | BGE-M3, ChromaDB, SQLite FTS5, BM25, RRF, BGE Reranker |
+| Document processing | Docling, MarkItDown, Pillow, optional OpenAI-compatible or Hugging Face VLM |
+| Client and observability | Vue 3, Vite, SSE, LangSmith |
+| Quality and operations | Pytest, offline fixtures, model routing, TTL cache, budget controls |
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.10 or later
+- Node.js 18 or later for the Vue client
+- A compatible LLM API key and Tavily API key
+- Optional NVIDIA GPU for local BGE-M3 and reranker inference
+
+### Backend
 
 ```bash
-cd langgraph-deepresearch
-pip install -e .
-```
+git clone https://github.com/<your-account>/langgraph-deep-research.git
+cd langgraph-deep-research
 
-### 2. 配置环境变量
+python -m venv .venv
+# Linux / macOS
+source .venv/bin/activate
+# Windows PowerShell: .venv\\Scripts\\Activate.ps1
 
-```bash
+python -m pip install --upgrade pip
+pip install -e ".[dev]"
+
 cp .env.example .env
-# 编辑 .env 填入你的 API Key
+# Windows PowerShell: Copy-Item .env.example .env
 ```
 
-必需配置：
+Edit `.env` before running. At minimum, configure the following values:
 
-- `OPENAI_API_KEY`
-- `TAVILY_API_KEY`
+```dotenv
+OPENAI_API_KEY=<your-llm-api-key>
+OPENAI_BASE_URL=<openai-compatible-base-url>
+OPENAI_MODEL=<model-name>
+TAVILY_API_KEY=<your-tavily-key>
 
-持久化配置：
+# Required for production deployment.
+APP_ENV=production
+AUTH_JWT_SECRET=<random-secret-with-at-least-32-characters>
+```
 
-- `RESEARCH_DB_PATH`：计划版本、运行产物和 LangGraph checkpoint 共用的 SQLite 文件，默认 `./research.db`。
-
-可选 LangSmith Trace：
-
-- 默认关闭：将 `LANGSMITH_TRACING=true` 并配置 `LANGSMITH_API_KEY` 后启用。
-- `LANGSMITH_CAPTURE_CONTENT=false` 保持输入输出隐藏；Trace metadata 只包含运行标识、模型/Prompt 版本和脱敏标记。
-- LangSmith 未配置或不可达时自动降级，不影响本地事件和研究流程。
-
-P1.3 模型路由、缓存与预算：
-
-- 每个角色默认回退到 `OPENAI_MODEL`；只在需要时设置 `ROUTER_MODEL`、`PLANNER_MODEL`、`SUMMARIZER_MODEL`、`REPORTER_MODEL`、`REPAIR_MODEL` 或 `JUDGE_MODEL`。
-- 可选的 `*_TEMPERATURE` 和 `*_MAX_TOKENS` 仅影响对应角色。`MODEL_PRICING_JSON` 未提供时只记录 Token，成本状态为 `unavailable`，不会猜测价格。
-- `SEARCH_CACHE_ENABLED=true` 使用 `RESEARCH_DB_PATH` 中的 SQLite TTL 缓存；缓存命中会保留来源快照并在任务和 SSE 事件中标记 `cache_hit=true`。离线评测快照不会进入此缓存。
-- 新运行会固化 `RUN_MAX_TASKS=5`、`RUN_MAX_SEARCH_ATTEMPTS=3`、`RUN_MAX_FORMAT_REPAIRS=1` 与 `RUN_MAX_ELAPSED_SECONDS=300`。`RUN_MAX_TOTAL_TOKENS` 和 `RUN_MAX_ESTIMATED_COST` 留空时禁用；已并行启动任务的总量限制是协作式的，报告会明确标注受预算影响的范围。
-
-离线路由对比示例：
+Start the API service:
 
 ```bash
-python -m src.evaluation.cli --offline --dataset evaluation_data/v1-draft \
-  --runs 3 --route-label baseline --model-label OPENAI_MODEL --output-dir evaluation_results/baseline
-
-# 仅通过环境变量覆盖需要比较的角色模型，再写入独立目录。
-SUMMARIZER_MODEL=your-research-model python -m src.evaluation.cli --offline \
-  --dataset evaluation_data/v1-draft --runs 3 --route-label candidate \
-  --model-label candidate --output-dir evaluation_results/candidate
+uvicorn src.main:app --host 0.0.0.0 --port 8000
 ```
 
-每个产物目录的 `config.json`、`results.json` 与 `summary.md` 分别保存路由指纹、任务级 Token/缓存/成本指标和聚合质量、延迟、失败率指标；非空输出目录会拒绝覆盖。
-
-### 3. 运行服务
+Start the document-ingestion worker in a separate terminal. Uploaded documents remain queued until this worker processes them:
 
 ```bash
-python -m src.main
-# 或
-uvicorn src.main:app --reload
+python -m src.documents.worker --poll-seconds 1
 ```
 
-## API 使用
+The health endpoint is available at `GET /healthz`.
 
-### 同步请求
+### Frontend
+
+For local development:
 
 ```bash
-curl -X POST http://localhost:8000/research \
-  -H "Content-Type: application/json" \
-  -d '{"topic": "Python 异步编程最佳实践"}'
+cd frontend
+npm ci
+npm run dev
 ```
 
-### 流式请求
+The frontend defaults to `http://localhost:8000`. To target another API address, configure the build-time variable:
 
 ```bash
-curl -X POST http://localhost:8000/research/stream \
-  -H "Content-Type: application/json" \
-  -d '{"topic": "Python 异步编程最佳实践"}'
+VITE_API_BASE_URL=https://api.example.com npm run build
 ```
 
-响应为标准 SSE，每个事件包含 `event`、`id` 和 JSON `data`，例如：
+For production, run `npm run build` and serve `frontend/dist/` through a static web server such as Nginx or Caddy. The FastAPI application does not serve the generated frontend bundle.
 
-```text
-event: task_completed
-id: evt_xxx
-data: {"event_id":"evt_xxx","run_id":"run_xxx","task_id":"task_xxx","type":"task_completed","payload":{"status":"succeeded","attempt":1}}
+## Document RAG Configuration
+
+The default setup uses local Hugging Face models. On a deployment machine with a 12 GB GPU, explicitly select a GPU and begin with conservative batch sizes:
+
+```dotenv
+EMBEDDINGS_PROVIDER=huggingface
+EMBEDDINGS_MODEL=BAAI/bge-m3
+EMBEDDINGS_DEVICE=cuda:0
+EMBEDDINGS_BATCH_SIZE=16
+
+RERANKER_PROVIDER=flagembedding
+RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+RERANKER_DEVICE=cuda:0
+RERANKER_BATCH_SIZE=4
 ```
 
-### 计划确认后执行
+Keep production data outside the repository and assign durable absolute paths:
 
-`POST /plans` 只生成并持久化计划，不会调用搜索工具。确认后才能创建运行：
+```dotenv
+RESEARCH_DB_PATH=/data/deep-research/research.db
+CHROMA_PERSIST_DIR=/data/deep-research/chroma-memory
+DOCUMENT_STORAGE_ROOT=/data/deep-research/documents
+DOCUMENT_CHROMA_PERSIST_DIR=/data/deep-research/chroma-documents
+```
+
+Embedding indexes from different models are not interchangeable. Rebuild the corresponding Chroma index after changing the embedding model. See [docs/本地Embedding部署.md](docs/本地Embedding部署.md) for GPU and multi-replica considerations.
+
+## Testing and Evaluation
+
+Run the automated regression suite:
 
 ```bash
-# 1. 创建计划，响应中的 plan 包含 plan_id 和 plan_version
-curl -X POST http://localhost:8000/plans \
-  -H "Content-Type: application/json" \
-  -d '{"topic": "Python 异步编程最佳实践"}'
-
-# 2. 确认计划
-curl -X POST http://localhost:8000/plans/{plan_id}/versions/1/confirm
-
-# 3. 基于已确认版本执行；服务会使用 run_id 作为 checkpoint thread_id
-curl -X POST http://localhost:8000/runs \
-  -H "Content-Type: application/json" \
-  -d '{"plan_id": "{plan_id}", "plan_version": 1}'
+pytest -q
 ```
 
-失败运行可通过 `POST /runs/{run_id}/resume` 恢复；失败任务可通过
-`POST /runs/{run_id}/tasks/{task_id}/retry` 重试。重试仅执行目标任务，并追加新的报告版本。
+Run the offline evaluation dataset without calling external models:
 
-## API 端点
+```bash
+python -m src.evaluation.cli --offline --dataset evaluation_data/v1 \
+  --runs 3 --route-label baseline --model-label OPENAI_MODEL \
+  --output-dir evaluation_results/baseline
+```
 
-| 端点 | 方法 | 描述 |
-|------|------|------|
-| `/healthz` | GET | 健康检查 |
-| `/research` | POST | 同步执行研究 |
-| `/research/stream` | POST | 持久化一键研究并通过标准 SSE 推送事件 |
-| `/plans` | POST | 生成并保存未确认计划，不执行搜索 |
-| `/plans/{plan_id}/versions/{version}` | GET / PUT | 查询计划或保存新的计划版本 |
-| `/plans/{plan_id}/versions/{version}/confirm` | POST | 确认计划版本 |
-| `/runs` | POST | 基于已确认计划执行研究 |
-| `/runs/{run_id}` | GET | 查询运行、任务尝试和报告版本 |
-| `/runs/{run_id}/resume` | POST | 从 SQLite checkpoint 恢复运行 |
-| `/runs/{run_id}/tasks/{task_id}/retry` | POST | 重试失败任务并生成新报告版本 |
+The runner records model routing, prompts, dataset version, fixture snapshots, quality metrics, latency, cache behavior, token usage, and available cost estimates in a new output directory. It refuses to overwrite an existing output directory.
 
-## 项目来源说明
+## Validation Status and Boundaries
 
-本项目基于 [datawhalechina/hello-agents](https://github.com/datawhalechina/hello-agents.git) 第十四章的思路进行实现，当前版本使用 LangGraph 对整体流程进行了重新组织与重构。
+- The P2.7 controlled acceptance flow passes text-first PDF conversion through the MarkItDown fallback, parent-child chunking, SQLite/FTS5 and Chroma indexing, hybrid retrieval, reranker degradation, document delete/restore/purge, cross-user isolation, and diagnostic redaction.
+- The acceptance run deliberately uses deterministic embedding and reranker adapters. It does **not** claim a completed production validation of real BGE reranker inference.
+- Docling image extraction and VLM visual enrichment require model downloads and explicit VLM configuration. They are implemented with unit coverage, but the real-model acceptance path must be revalidated in the deployment environment before being presented as a completed capability.
+- LangSmith is disabled by default. When enabled, content capture remains disabled; do not upload raw private documents, images, API keys, authorization headers, or local storage paths to traces.
 
-感谢原项目作者及贡献者的开源分享。
+See [docs/2026-08-26-P2.7验收记录.md](docs/2026-08-26-P2.7验收记录.md) for the reproducible acceptance record.
 
-## 致谢
+## Repository Hygiene
+
+Do not commit `.env`, user uploads, SQLite databases, Chroma directories, model caches, frontend dependencies, or evaluation outputs. They may contain credentials, private content, local paths, or machine-specific indexes.
+
+## Upstream Attribution
+
+This repository is an extended implementation inspired by Chapter 14 of [datawhalechina/hello-agents](https://github.com/datawhalechina/hello-agents). It reorganizes the original research flow around LangGraph and adds structured research artifacts, evaluation, authentication, private document RAG, and a Vue client.
+
+This project is not affiliated with the upstream maintainers. Before publishing or redistributing it, retain all required notices and comply with the upstream repository's license and attribution terms.
+
+## Acknowledgements
 
 - [LangGraph](https://github.com/langchain-ai/langgraph)
 - [LangChain](https://github.com/langchain-ai/langchain)
 - [Tavily](https://www.tavily.com/)
-- [datawhalechina/hello-agents](https://github.com/datawhalechina/hello-agents.git)
-
-## License
-
-请在使用本项目时同时关注原参考项目的许可证要求，并确保遵循相关开源协议。
+- [datawhalechina/hello-agents](https://github.com/datawhalechina/hello-agents)
