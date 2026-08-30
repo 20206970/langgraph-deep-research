@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Node / frontend build
+node_modules/
+frontend/dist/
+
+# Local runtime data & secrets
+.env
+*.db
+chroma_data*/
+document_data/
+
+# Model caches
+.cache/
