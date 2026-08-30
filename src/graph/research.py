@@ -523,6 +523,19 @@ def _generate_alternative_queries(query: str, attempt: int) -> list[str]:
     return alternatives
 
 
+_TRANSIENT_ERROR_PATTERN = re.compile(
+    r"429|rate.?limit|too many requests|速率限制|temporarily|timeout|timed out|connection",
+    re.IGNORECASE,
+)
+
+
+def _retry_backoff_seconds(error_text: str, attempt: int) -> float:
+    """Provider 限流/网络类瞬时错误立即重试只会撞进同一限流窗口，指数退避等待。"""
+    if not _TRANSIENT_ERROR_PATTERN.search(error_text or ""):
+        return 0.0
+    return min(45.0, 5.0 * (3 ** (attempt - 1)))
+
+
 def _result_update(
     result: TaskResult,
     sources: list[Any],
@@ -912,6 +925,7 @@ def search_summarize_node(
                     source_refs,
                 )
             if attempt < budget.max_search_attempts:
+                backoff = _retry_backoff_seconds(last_error, attempt)
                 emit_event(
                     state,
                     EventType.RETRYING,
@@ -924,8 +938,11 @@ def search_summarize_node(
                         "estimated_cost": cost_snapshot()[0],
                         "cost_status": cost_snapshot()[1],
                         "budget_status": "within_budget",
+                        "retry_delay_seconds": backoff,
                     },
                 )
+                if backoff:
+                    time.sleep(backoff)
 
     attempts = previous_attempts + budget.max_search_attempts
     failed = decorate_result(
