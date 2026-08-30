@@ -8,7 +8,9 @@ from typing import Optional
 from langchain_core.tools import tool
 
 
-NOTES_DIR = Path("./notes")
+# 运行笔记目录：默认工作区 ./notes；部署环境经 NOTES_DIR 指向 /data 持久化路径，
+# 避免 rsync --delete 更新 /opt 代码副本时清空运行数据。
+NOTES_DIR = Path(os.getenv("NOTES_DIR") or "./notes")
 
 
 def _ensure_notes_dir():
