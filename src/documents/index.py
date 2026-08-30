@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -157,20 +158,27 @@ class DocumentIndexService:
         self.embeddings_config = embeddings_config
         self._embeddings = embeddings
         self._vector_store = vector_store
+        self._lazy_init_lock = threading.Lock()
 
     @property
     def embeddings(self):
         if self._embeddings is None:
-            try:
-                self._embeddings = create_embeddings(self.embeddings_config)
-            except Exception as error:
-                raise DocumentIndexError("document embedding model initialization failed") from error
+            # Parallel research tasks may reach this first-use path concurrently;
+            # an unsynchronized load builds duplicate GPU models in every racing thread.
+            with self._lazy_init_lock:
+                if self._embeddings is None:
+                    try:
+                        self._embeddings = create_embeddings(self.embeddings_config)
+                    except Exception as error:
+                        raise DocumentIndexError("document embedding model initialization failed") from error
         return self._embeddings
 
     @property
     def vector_store(self) -> DocumentVectorStore:
         if self._vector_store is None:
-            self._vector_store = ChromaDocumentVectorStore(self.document_config)
+            with self._lazy_init_lock:
+                if self._vector_store is None:
+                    self._vector_store = ChromaDocumentVectorStore(self.document_config)
         return self._vector_store
 
     @staticmethod

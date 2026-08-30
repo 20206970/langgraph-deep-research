@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Protocol, Sequence
 
@@ -23,21 +24,26 @@ class FlagEmbeddingReranker:
     def __init__(self, config: RerankerConfig):
         self.config = config
         self._model = None
+        self._model_lock = threading.Lock()
 
     @property
     def model(self):
         if self._model is None:
-            try:
-                from FlagEmbedding import FlagReranker
-            except ImportError as error:
-                raise RerankerError("FlagEmbedding is not installed") from error
-            try:
-                self._model = FlagReranker(
-                    self.config.model,
-                    use_fp16=self.config.device.lower() not in {"cpu", "none"},
-                )
-            except Exception as error:
-                raise RerankerError("configured reranker model could not be initialized") from error
+            # Parallel research tasks may reach this first-use path concurrently;
+            # an unsynchronized load builds duplicate GPU models in every racing thread.
+            with self._model_lock:
+                if self._model is None:
+                    try:
+                        from FlagEmbedding import FlagReranker
+                    except ImportError as error:
+                        raise RerankerError("FlagEmbedding is not installed") from error
+                    try:
+                        self._model = FlagReranker(
+                            self.config.model,
+                            use_fp16=self.config.device.lower() not in {"cpu", "none"},
+                        )
+                    except Exception as error:
+                        raise RerankerError("configured reranker model could not be initialized") from error
         return self._model
 
     def score(self, query: str, documents: Sequence[str]) -> list[float]:
