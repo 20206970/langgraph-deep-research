@@ -425,7 +425,10 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
 
     try:
         llm = _create_llm("planner")
-        agent = create_planner_agent(llm)
+        from src.config import get_config
+
+        budget = budget_from_config(get_config())
+        agent = create_planner_agent(llm, max_tasks=budget.max_tasks)
 
         try:
             from src.session import get_session_memory
@@ -448,9 +451,6 @@ def planner_node(state: dict[str, Any]) -> dict[str, Any]:
 
 请为此主题规划研究任务，并严格遵循系统中的 JSON 输出契约。"""
         output = _strip_reasoning(_message_content(agent.invoke({"messages": [("user", prompt)]})))
-        from src.config import get_config
-
-        budget = budget_from_config(get_config())
         repairer = _plan_repairer(_create_llm("repair")) if budget.max_format_repairs else None
         plan = parse_task_plan_with_repair(
             output,

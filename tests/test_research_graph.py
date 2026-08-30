@@ -121,7 +121,7 @@ def test_graph_aggregates_parallel_results_by_task_id_and_plan_order(monkeypatch
     reporter = FakeReporter()
     _disable_memory(monkeypatch)
     monkeypatch.setattr(research, "_create_llm", lambda *_args, **_kwargs: FakeLlm())
-    monkeypatch.setattr(research, "create_planner_agent", lambda _llm: FakePlanner(planner_output))
+    monkeypatch.setattr(research, "create_planner_agent", lambda _llm, **_kwargs: FakePlanner(planner_output))
     monkeypatch.setattr(research, "create_summarizer_agent", lambda _llm: FakeSummarizer())
     monkeypatch.setattr(research, "create_reporter_agent", lambda _llm: reporter)
 
@@ -143,7 +143,7 @@ def test_invalid_planner_output_does_not_dispatch_search(monkeypatch):
     dispatched = {"summarizer": 0}
     _disable_memory(monkeypatch)
     monkeypatch.setattr(research, "_create_llm", lambda *_args, **_kwargs: llm)
-    monkeypatch.setattr(research, "create_planner_agent", lambda _llm: FakePlanner("not json"))
+    monkeypatch.setattr(research, "create_planner_agent", lambda _llm, **_kwargs: FakePlanner("not json"))
 
     def unexpected_summarizer(_llm):
         dispatched["summarizer"] += 1
@@ -177,7 +177,7 @@ def test_confirmed_plan_executes_without_calling_planner(monkeypatch):
     monkeypatch.setattr(
         research,
         "create_planner_agent",
-        lambda _llm: (_ for _ in ()).throw(AssertionError("confirmed plans must skip Planner")),
+        lambda _llm, **_kwargs: (_ for _ in ()).throw(AssertionError("confirmed plans must skip Planner")),
     )
     monkeypatch.setattr(research, "create_summarizer_agent", lambda _llm: FakeSummarizer())
     monkeypatch.setattr(research, "create_reporter_agent", lambda _llm: reporter)
@@ -216,7 +216,7 @@ def test_graph_publishes_task_and_run_events(monkeypatch, tmp_path):
     reporter = FakeReporter()
     _disable_memory(monkeypatch)
     monkeypatch.setattr(research, "_create_llm", lambda *_args, **_kwargs: FakeLlm())
-    monkeypatch.setattr(research, "create_planner_agent", lambda _llm: AssertionError("Planner must be skipped"))
+    monkeypatch.setattr(research, "create_planner_agent", lambda _llm, **_kwargs: AssertionError("Planner must be skipped"))
     monkeypatch.setattr(research, "create_summarizer_agent", lambda _llm: FakeSummarizer())
     monkeypatch.setattr(research, "create_reporter_agent", lambda _llm: reporter)
 
