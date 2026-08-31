@@ -923,14 +923,17 @@ def create_app(
                             tasks=session.last_tasks,
                         ),
                     )
-                final_event = publisher.publish(
-                    EventType.COMPLETED,
+                # The final report is an intentional user-facing SSE response, not a
+                # diagnostic event. Keep it transient so diagnostic redaction and
+                # event persistence cannot truncate or retain the report body.
+                final_event = ResearchEvent(
+                    run_id=run_id,
+                    type=EventType.COMPLETED,
                     payload={
                         "status": result["run"]["status"],
                         "report_markdown": report,
                         "report_version": reports[-1].get("report_version") if reports else None,
                     },
-                    persist=False,
                 )
                 yield encode_sse(final_event)
             except Exception as exc:

@@ -11,6 +11,9 @@ from src.tracing import build_trace_callbacks
 from src.state import TaskItem, TaskPlan
 
 
+STREAM_REPORT = "# Stream report\n\n" + ("完整报告内容。" * 100)
+
+
 def _plan(topic="stream topic"):
     return TaskPlan(
         topic=topic,
@@ -122,7 +125,7 @@ class FakeStreamGraph:
             "report_artifact": {
                 "report_id": "stream_report",
                 "run_id": run["run_id"],
-                "markdown": "# Stream report",
+                "markdown": STREAM_REPORT,
                 "status": "succeeded",
             },
         }
@@ -147,11 +150,27 @@ def test_stream_endpoint_emits_standard_sse_and_persists_event(tmp_path, monkeyp
     assert "event: plan_confirmed" in response.text
     assert "event: completed" in response.text
     assert "id: " in response.text
-    assert "# Stream report" in response.text
+    events = [
+        json.loads(line[6:])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    completed_event = next(
+        event
+        for event in events
+        if event["type"] == EventType.COMPLETED.value
+        and "report_markdown" in event["payload"]
+    )
+    assert completed_event["payload"]["report_markdown"] == STREAM_REPORT
+    assert "[TRUNCATED]" not in completed_event["payload"]["report_markdown"]
     assert "data: {\"topic\"" not in response.text
     assert fake_graph.config["configurable"]["thread_id"] == fake_graph.run_id
     assert any(
         event.type == EventType.PLAN_CONFIRMED
+        for event in repository.list_events(fake_graph.run_id, owner_id=owner_id)
+    )
+    assert all(
+        "report_markdown" not in event.payload
         for event in repository.list_events(fake_graph.run_id, owner_id=owner_id)
     )
     repository.close()
