@@ -1,55 +1,191 @@
-/* 全局样式变量定义 */
+/* ================================================================
+   深度研究工作台 · 墨绿档案设计体系
+   隐喻：图书馆档案室（墨绿铬）× 学术手稿（纸白阅读面）× 朱砂印记
+   ================================================================ */
+@import url('/fonts/fonts.css');
+
 :root {
-  --bg-primary: #0f172a;
-  --bg-secondary: #1e293b;
-  --accent: #3b82f6;
-  --accent-hover: #60a5fa;
-  --success: #22c55e;
-  --text-primary: #f1f5f9;
-  --text-secondary: #94a3b8;
-  --border: #334155;
-  --shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
-  --radius-lg: 12px;
-  --radius-md: 8px;
+  /* 墨绿铬（界面底色阶） */
+  --ink-950: #0a1610;
+  --ink-900: #0f1e15;
+  --ink-800: #142a1d;
+  --ink-700: #1c3627;
+
+  /* 纸（报告阅读面） */
+  --paper: #f6f1e6;
+  --paper-dim: #ece4d1;
+  --paper-text: #263129;
+  --paper-text-secondary: #5d6a5e;
+
+  /* 铬上文字 */
+  --text-primary: #ece7d9;
+  --text-secondary: #a9b4a5;
+  --text-faint: #71806f;
+
+  /* 描边（纸色低透明度） */
+  --border: rgba(244, 239, 228, 0.13);
+  --border-strong: rgba(244, 239, 228, 0.28);
+
+  /* 朱砂（主行动 / 激活 / 印记） */
+  --accent: #c0492f;
+  --accent-hover: #d75c40;
+  --accent-soft: rgba(192, 73, 47, 0.16);
+
+  /* 状态 */
+  --status-success: #58c47a;
+  --status-running: #d9a441;
+  --status-failed: #d16a5a;
+  --error-text: #e8a08f;
+
+  /* 几何与动效 */
+  --radius-lg: 10px;
+  --radius-md: 7px;
   --radius-sm: 4px;
-  --transition: 300ms ease-in-out;
+  --shadow: 0 14px 44px rgba(0, 0, 0, 0.5);
+  --transition: 220ms ease;
+
+  /* 字体栈：界面用系统中文无衬线（零下载），阅读面用自托管宋体 */
+  --font-ui: 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC',
+    'Source Han Sans SC', system-ui, sans-serif;
+  --font-serif: 'Noto Serif SC', 'Songti SC', 'SimSun', serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo,
+    Consolas, monospace;
 }
 
-/* 全局重置 */
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
 }
 
+html {
+  background: var(--ink-950);
+}
+
 body {
-  font-family: 'Inter', system-ui, sans-serif;
-  background: var(--bg-primary);
+  font-family: var(--font-ui);
+  background: var(--ink-950);
   color: var(--text-primary);
   min-height: 100vh;
   line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* 标题字体 - 使用衬线字体增强中文优雅感 */
 h1, h2, h3 {
-  font-family: 'Noto Serif SC', serif;
+  font-family: var(--font-serif);
+  font-weight: 700;
 }
 
-/* 代码字体 */
-code, pre {
-  font-family: 'JetBrains Mono', monospace;
+code, pre, kbd {
+  font-family: var(--font-mono);
 }
 
-/* 按钮基础样式 */
 button {
   cursor: pointer;
   font-family: inherit;
-  transition: var(--transition);
+  transition: color var(--transition), border-color var(--transition),
+    background-color var(--transition), box-shadow var(--transition);
 }
 
-/* 容器类 - 限制内容最大宽度并居中 */
+input, textarea, select {
+  font-family: inherit;
+}
+
+a {
+  color: var(--accent-hover);
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--paper);
+}
+
+/* 滚动条：细纸色轨道 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(244, 239, 228, 0.22) transparent;
+}
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(244, 239, 228, 0.2);
+  border-radius: 5px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 纸面纹理（极淡横纹，如 laid paper） */
+.paper-grain {
+  background-image: repeating-linear-gradient(
+    0deg,
+    rgba(38, 49, 41, 0.022) 0 1px,
+    transparent 1px 4px
+  );
+}
+
+/* 共享动效 */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.82); }
+}
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(7px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes breathe {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
 .container {
   max-width: 900px;
   margin: 0 auto;
   padding: 24px;
+}
+
+/* ================================================================
+   highlight.js 主题 · 墨绿档案配色
+   （代码块为纸面上的深墨绿「屏幕」，见 ReportReader/ReportCard）
+   ================================================================ */
+.hljs {
+  color: #dfe6d8;
+  background: transparent;
+}
+.hljs-comment, .hljs-quote {
+  color: #6f7d6f;
+  font-style: italic;
+}
+.hljs-keyword, .hljs-selector-tag, .hljs-tag, .hljs-name, .hljs-meta {
+  color: #d9a441;
+}
+.hljs-string, .hljs-regexp, .hljs-addition {
+  color: #7ac78f;
+}
+.hljs-number, .hljs-literal, .hljs-symbol, .hljs-bullet {
+  color: #d9704f;
+}
+.hljs-title, .hljs-section, .hljs-title.function_ {
+  color: #8fd0ac;
+}
+.hljs-attr, .hljs-attribute, .hljs-variable, .hljs-template-variable,
+.hljs-type, .hljs-selector-class, .hljs-selector-attr {
+  color: #cdbd97;
+}
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 700; }
+.hljs-deletion { color: var(--status-failed); }
+
+/* ================================================================
+   打印：只打阅读器内容（阅读器组件另有局部打印样式）
+   ================================================================ */
+@media print {
+  body {
+    background: #fff;
+  }
+  #app {
+    display: none !important;
+  }
 }

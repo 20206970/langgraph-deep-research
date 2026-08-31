@@ -37,7 +37,7 @@ const setUseAll = (event) => {
 <template>
   <section class="scope-selector" :class="{ disabled }" aria-label="本次研究引用范围">
     <div class="scope-summary">
-      <span class="scope-kicker">资料范围</span>
+      <span class="scope-kicker">▍资料范围</span>
       <strong>{{ scopeLabel }}</strong>
     </div>
     <details :open="readyDocuments.length > 0 && !disabled">
@@ -72,22 +72,81 @@ const setUseAll = (event) => {
   width: min(800px, calc(100% - 48px));
   margin: 0 auto;
   padding: 10px 0;
-  border-top: 1px solid var(--border);
-  background: var(--bg-secondary);
 }
 
 .scope-summary { display: grid; gap: 1px; min-width: 0; }
-.scope-kicker { color: var(--text-secondary); font-size: 0.7rem; font-weight: 700; }
-.scope-summary strong { overflow: hidden; color: var(--text-primary); font-size: 0.82rem; text-overflow: ellipsis; white-space: nowrap; }
+
+.scope-kicker {
+  color: var(--accent-hover);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.scope-summary strong {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 0.82rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 details { min-width: 0; }
-summary { width: fit-content; color: var(--accent-hover); cursor: pointer; font-size: 0.8rem; }
-.scope-options { display: grid; gap: 8px; max-height: 144px; margin-top: 10px; overflow-y: auto; }
-.scope-all, .scope-document { display: flex; min-width: 0; gap: 8px; align-items: center; color: var(--text-secondary); font-size: 0.78rem; }
-.scope-document span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.scope-empty { color: var(--text-secondary); font-size: 0.78rem; }
-.library-button { border: 1px solid var(--border); border-radius: 4px; background: transparent; color: var(--text-secondary); font-size: 0.78rem; padding: 6px 9px; }
-.library-button:hover:not(:disabled) { border-color: var(--accent); color: var(--text-primary); }
+
+summary {
+  width: fit-content;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.78rem;
+}
+
+summary:hover { color: var(--accent-hover); }
+
+.scope-options {
+  display: grid;
+  gap: 8px;
+  max-height: 144px;
+  margin-top: 10px;
+  overflow-y: auto;
+}
+
+.scope-all, .scope-document {
+  display: flex;
+  min-width: 0;
+  gap: 8px;
+  align-items: center;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+}
+
+.scope-all { color: var(--text-primary); }
+
+.scope-document span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scope-empty { color: var(--text-faint); font-size: 0.78rem; }
+
+input[type='checkbox'] { accent-color: var(--accent); }
+
+.library-button {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.76rem;
+  padding: 6px 11px;
+}
+
+.library-button:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--ink-800);
+  color: var(--paper);
+}
+
 .disabled { opacity: 0.58; }
 
 @media (max-width: 620px) {

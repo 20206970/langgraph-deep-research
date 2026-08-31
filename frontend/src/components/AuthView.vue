@@ -45,10 +45,10 @@ const submit = () => {
 <template>
   <main class="auth-shell">
     <section class="auth-intro" aria-labelledby="auth-title">
-      <div class="product-mark">LG</div>
-      <p class="eyebrow">PRIVATE RESEARCH WORKSPACE</p>
-      <h1 id="auth-title">LangGraph<br>深度研究</h1>
-      <p class="intro-copy">围绕你的论文资料组织检索、证据与研究结论。</p>
+      <div class="product-seal">研</div>
+      <p class="eyebrow">PRIVATE RESEARCH ARCHIVE</p>
+      <h1 id="auth-title">深度研究<br>工作台</h1>
+      <p class="intro-copy">围绕你的论文资料组织检索、证据与研究结论，每一次研究都归档成一份完整的手稿。</p>
     </section>
 
     <section class="auth-form" aria-label="账户认证">
@@ -85,93 +85,102 @@ const submit = () => {
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(360px, 0.85fr);
   min-height: 100vh;
-  background: #12241f;
+  background: var(--ink-950);
 }
 
+/* 左：档案室墙面 */
 .auth-intro {
   display: flex;
   flex-direction: column;
   justify-content: center;
+  border-right: 1px solid rgba(244, 239, 228, 0.08);
+  background:
+    radial-gradient(1200px 600px at 12% 8%, rgba(28, 54, 39, 0.55), transparent 62%),
+    var(--ink-900);
   padding: clamp(48px, 10vh, 120px) clamp(36px, 9vw, 144px);
-  color: #eef5ec;
+  color: var(--text-primary);
 }
 
-.product-mark {
+.product-seal {
   display: grid;
-  width: 46px;
-  height: 46px;
+  width: 52px;
+  height: 52px;
   place-items: center;
-  margin-bottom: 64px;
-  border: 1px solid #74c69d;
-  color: #b7e4c7;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.78rem;
+  margin-bottom: 60px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--paper);
+  font-family: var(--font-serif);
+  font-size: 1.42rem;
   font-weight: 700;
+  box-shadow: inset 0 0 0 2px rgba(246, 241, 230, 0.32), 0 6px 26px rgba(192, 73, 47, 0.4);
 }
 
 .eyebrow {
-  color: #9fc5ad;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--accent-hover);
+  font-family: var(--font-mono);
   font-size: 0.72rem;
   font-weight: 700;
+  letter-spacing: 0.32em;
 }
 
 h1 {
   max-width: 640px;
-  margin: 14px 0 20px;
-  font-family: Georgia, 'Noto Serif SC', serif;
-  font-size: clamp(3rem, 5.2vw, 5.8rem);
-  font-weight: 500;
-  line-height: 0.98;
+  margin: 16px 0 22px;
+  font-family: var(--font-serif);
+  font-size: clamp(2.9rem, 5.2vw, 5.4rem);
+  font-weight: 700;
+  line-height: 1.04;
+  letter-spacing: 0.04em;
 }
 
 .intro-copy {
-  max-width: 380px;
-  color: #bfd7c4;
-  font-size: 1rem;
-  line-height: 1.8;
+  max-width: 400px;
+  border-left: 2px solid rgba(192, 73, 47, 0.55);
+  color: var(--text-secondary);
+  font-size: 0.98rem;
+  line-height: 1.9;
+  padding-left: 16px;
 }
 
+/* 右：登记台纸面 */
 .auth-form {
   display: flex;
   flex-direction: column;
   justify-content: center;
+  background: var(--paper);
+  color: var(--paper-text);
   padding: clamp(36px, 7vw, 112px);
-  background: #f4f7f2;
-  color: #1f3029;
 }
 
 .auth-tabs {
   display: grid;
   grid-template-columns: 1fr 1fr;
   margin-bottom: 30px;
-  border-bottom: 1px solid #cad7cd;
+  border-bottom: 1px solid rgba(38, 49, 41, 0.2);
 }
 
 .auth-tabs button {
-  padding: 10px 0;
   border: 0;
   border-bottom: 2px solid transparent;
   background: transparent;
-  color: #64746a;
+  color: var(--paper-text-secondary);
   font-size: 0.92rem;
+  padding: 10px 0;
 }
 
 .auth-tabs button.active {
-  border-bottom-color: #167d6a;
-  color: #173d32;
+  border-bottom-color: var(--accent);
+  color: var(--paper-text);
   font-weight: 700;
 }
 
-form {
-  display: grid;
-  gap: 18px;
-}
+form { display: grid; gap: 18px; }
 
 label {
   display: grid;
   gap: 7px;
-  color: #42544a;
+  color: var(--paper-text-secondary);
   font-size: 0.82rem;
   font-weight: 700;
 }
@@ -179,39 +188,38 @@ label {
 input {
   width: 100%;
   min-height: 44px;
-  padding: 10px 12px;
-  border: 1px solid #b8c8bd;
-  border-radius: 4px;
-  background: #fff;
-  color: #183228;
+  border: 1px solid rgba(38, 49, 41, 0.28);
+  border-radius: var(--radius-sm);
+  background: #fdfaf3;
+  color: var(--paper-text);
   font: inherit;
   font-weight: 400;
+  padding: 10px 12px;
 }
 
 input:focus {
-  outline: 3px solid rgba(22, 125, 106, 0.18);
-  border-color: #167d6a;
+  outline: 3px solid rgba(192, 73, 47, 0.16);
+  border-color: var(--accent);
 }
 
 .auth-error {
-  color: #a23333;
+  color: var(--accent);
   font-size: 0.83rem;
   line-height: 1.5;
 }
 
 .auth-submit {
   min-height: 46px;
-  border: 1px solid #126b5b;
-  border-radius: 4px;
-  background: #167d6a;
-  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--paper);
   font-size: 0.92rem;
   font-weight: 700;
+  letter-spacing: 0.08em;
 }
 
-.auth-submit:hover:not(:disabled) {
-  background: #115f51;
-}
+.auth-submit:hover:not(:disabled) { background: var(--accent-hover); }
 
 .auth-submit:disabled {
   cursor: wait;
@@ -221,8 +229,8 @@ input:focus {
 @media (max-width: 760px) {
   .auth-shell { grid-template-columns: 1fr; }
   .auth-intro { min-height: 35vh; padding: 42px 28px; }
-  .product-mark { margin-bottom: 36px; }
-  h1 { font-size: 3.15rem; }
+  .product-seal { margin-bottom: 32px; }
+  h1 { font-size: 2.9rem; }
   .auth-form { min-height: 65vh; padding: 36px 28px; }
 }
 </style>

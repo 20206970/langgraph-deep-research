@@ -1,162 +1,187 @@
 <script setup>
-import { computed } from 'vue'
-import { marked } from 'marked'
-import hljs from 'highlight.js'
-import DOMPurify from 'dompurify'
+import { computed, nextTick, ref, watch } from 'vue'
+import {
+  countCjkChars,
+  downloadMarkdown,
+  highlightCodeBlocks,
+  renderMarkdown
+} from '../lib/markdown.js'
 
 const props = defineProps({
-  content: {
-    type: String,
-    default: ''
+  content: { type: String, default: '' },
+  topic: { type: String, default: '' }
+})
+
+const emit = defineEmits(['read'])
+
+const previewEl = ref(null)
+
+const renderedContent = computed(() => renderMarkdown(props.content))
+const charCount = computed(() => countCjkChars(props.content))
+
+watch(
+  () => props.content,
+  async () => {
+    await nextTick()
+    highlightCodeBlocks(previewEl.value)
   },
-  topic: {
-    type: String,
-    default: ''
-  }
-})
+  { immediate: true }
+)
 
-marked.setOptions({
-  highlight: function(code, lang) {
-    if (lang && hljs.getLanguage(lang)) {
-      return hljs.highlight(code, { language: lang }).value
-    }
-    return hljs.highlightAuto(code).value
-  },
-  breaks: true,
-  gfm: true
-})
-
-const renderedContent = computed(() => {
-  if (!props.content) return ''
-  const html = marked(props.content)
-  return DOMPurify.sanitize(html)
-})
-
-const downloadReport = () => {
-  const filename = `${(props.topic || '研究报告').replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '_')}.md`
-  const blob = new Blob([props.content], { type: 'text/markdown;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  URL.revokeObjectURL(url)
-}
+const handleDownload = () => downloadMarkdown(props.content, props.topic)
 </script>
 
 <template>
   <div class="report-card">
-    <div class="report-content" v-html="renderedContent"></div>
-    <div class="report-actions">
-      <button class="btn-download" @click="downloadReport">下载报告</button>
+    <div class="report-head">
+      <span class="report-mark">▍</span>
+      <span class="report-label">研究报告</span>
+      <span v-if="charCount" class="report-meta">约 {{ charCount.toLocaleString('zh-CN') }} 字</span>
+    </div>
+
+    <div class="report-preview paper-grain">
+      <!-- eslint-disable-next-line vue/no-v-html -->
+      <div ref="previewEl" class="preview-article" v-html="renderedContent"></div>
+    </div>
+
+    <div class="report-foot">
+      <button type="button" class="btn-read" @click="emit('read')">展开阅读</button>
+      <button type="button" class="btn-dl" @click="handleDownload">下载 .md</button>
     </div>
   </div>
 </template>
 
 <style scoped>
+/* 档案柜里抽出的一页手稿：纸面预览 + 渐隐遮罩 */
 .report-card {
-  margin-top: 8px;
+  margin-top: 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
+  background: var(--ink-800);
   overflow: hidden;
 }
 
-.report-content {
-  padding: 16px 20px;
-  max-height: 500px;
-  overflow-y: auto;
-  background: rgba(15, 23, 42, 0.6);
-  line-height: 1.8;
-  font-size: 0.9rem;
-}
-
-.report-content :deep(h1) {
-  font-size: 1.5rem;
-  margin: 20px 0 12px;
-  padding-bottom: 8px;
+.report-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 16px;
   border-bottom: 1px solid var(--border);
 }
 
-.report-content :deep(h2) {
-  font-size: 1.25rem;
-  margin: 16px 0 10px;
+.report-mark { color: var(--accent); font-size: 0.85rem; }
+
+.report-label {
+  color: var(--text-primary);
+  font-family: var(--font-serif);
+  font-size: 0.9rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
 }
 
-.report-content :deep(h3) {
-  font-size: 1.05rem;
-  margin: 12px 0 8px;
+.report-meta {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
 }
 
-.report-content :deep(p) {
+.report-preview {
+  position: relative;
+  max-height: 300px;
+  overflow: hidden;
+  background: var(--paper);
+  color: var(--paper-text);
+  -webkit-mask-image: linear-gradient(180deg, #000 74%, transparent 99%);
+  mask-image: linear-gradient(180deg, #000 74%, transparent 99%);
+}
+
+.preview-article {
+  font-family: var(--font-serif);
+  font-size: 0.82rem;
+  padding: 18px 24px 34px;
+}
+
+.preview-article :deep(h1) {
+  margin: 6px 0 12px;
+  padding-bottom: 10px;
+  border-bottom: 2px double rgba(38, 49, 41, 0.3);
+  font-size: 1.15rem;
+  text-align: center;
+}
+
+.preview-article :deep(h2) { margin: 18px 0 8px; font-size: 0.98rem; }
+.preview-article :deep(h2)::before { content: '▍'; margin-right: 6px; color: var(--accent); }
+.preview-article :deep(h3) { margin: 12px 0 6px; font-size: 0.88rem; color: #33413a; }
+
+.preview-article :deep(p) {
+  margin: 7px 0;
+  line-height: 1.85;
+  text-align: justify;
+  text-indent: 2em;
+}
+
+.preview-article :deep(blockquote) {
   margin: 10px 0;
+  border-left: 3px double rgba(38, 49, 41, 0.4);
+  background: rgba(38, 49, 41, 0.045);
+  color: var(--paper-text-secondary);
+  font-size: 0.94em;
+  padding: 6px 14px;
 }
 
-.report-content :deep(ul),
-.report-content :deep(ol) {
+.preview-article :deep(blockquote p) { text-indent: 0; }
+
+.preview-article :deep(code) {
+  border-radius: 3px;
+  background: rgba(38, 49, 41, 0.09);
+  color: #8a3823;
+  font-size: 0.86em;
+  padding: 1px 5px;
+}
+
+.preview-article :deep(pre) {
   margin: 10px 0;
-  padding-left: 24px;
+  border: 1px solid rgba(244, 239, 228, 0.07);
+  border-radius: 6px;
+  background: #0c1a12;
+  overflow: hidden;
+  padding: 12px 14px;
 }
 
-.report-content :deep(li) {
-  margin: 4px 0;
-}
+.preview-article :deep(pre code) { background: none; color: #dfe6d8; font-size: 0.76rem; padding: 0; }
 
-.report-content :deep(code) {
-  background: var(--bg-primary);
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-size: 0.85em;
-}
-
-.report-content :deep(pre) {
-  background: var(--bg-primary);
-  padding: 14px;
-  border-radius: var(--radius-sm);
-  overflow-x: auto;
-  margin: 12px 0;
-}
-
-.report-content :deep(pre code) {
-  background: none;
-  padding: 0;
-}
-
-.report-content :deep(a) {
-  color: var(--accent);
-  text-decoration: none;
-}
-
-.report-content :deep(a:hover) {
-  text-decoration: underline;
-}
-
-.report-content :deep(blockquote) {
-  border-left: 3px solid var(--accent);
-  padding-left: 14px;
-  margin: 12px 0;
-  color: var(--text-secondary);
-}
-
-.report-actions {
-  padding: 8px 16px;
-  border-top: 1px solid var(--border);
+.report-foot {
   display: flex;
   justify-content: flex-end;
+  gap: 9px;
+  border-top: 1px solid var(--border);
+  padding: 9px 14px;
 }
 
-.btn-download {
-  padding: 6px 14px;
-  background: transparent;
+.btn-read {
+  min-height: 32px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--paper);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  padding: 5px 18px;
+}
+
+.btn-read:hover { background: var(--accent-hover); }
+
+.btn-dl {
+  min-height: 32px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
+  background: transparent;
   color: var(--text-secondary);
-  font-size: 0.8rem;
+  font-size: 0.78rem;
+  padding: 5px 14px;
 }
 
-.btn-download:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-}
+.btn-dl:hover { border-color: var(--border-strong); color: var(--paper); }
 </style>

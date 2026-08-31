@@ -18,6 +18,8 @@ import DocumentPanel from './components/DocumentPanel.vue'
 import DocumentScopeSelector from './components/DocumentScopeSelector.vue'
 import HistoryPanel from './components/HistoryPanel.vue'
 import MessageBubble from './components/MessageBubble.vue'
+import ReportReader from './components/ReportReader.vue'
+import ResearchPipeline from './components/ResearchPipeline.vue'
 
 const user = ref(null)
 const authPending = ref(false)
@@ -34,6 +36,7 @@ const documents = ref([])
 const selectedDocumentIds = ref([])
 const useAllMyDocuments = ref(false)
 const documentRetrieval = ref(null)
+const readerState = ref({ open: false, topic: '', markdown: '', meta: {} })
 let removeUnauthorizedHandler = null
 
 const progressItems = computed(() => Object.values(taskProgress.value))
@@ -70,19 +73,40 @@ const updateTaskProgress = (event) => {
   }
   if (!event.task_id) return
   const payload = event.payload || {}
+  const previous = taskProgress.value[event.task_id]
   const status = payload.status || (
     event.type === 'task_failed' ? 'failed' :
-      event.type === 'task_completed' ? 'succeeded' : 'running'
+      event.type === 'task_completed' ? 'succeeded' :
+        event.type === 'retrying' ? 'retrying' : 'running'
   )
   taskProgress.value = {
     ...taskProgress.value,
     [event.task_id]: {
       taskId: event.task_id,
       status,
-      attempt: payload.attempt || taskProgress.value[event.task_id]?.attempt || 0,
+      attempt: payload.attempt || previous?.attempt || 0,
+      retryDelay: event.type === 'retrying'
+        ? (payload.retry_delay_seconds ?? null)
+        : (previous?.retryDelay ?? null),
       error: payload.error_message || ''
     }
   }
+}
+
+const openReader = ({ topic = '', markdown = '', meta = {} }) => {
+  readerState.value = { open: true, topic, markdown, meta }
+}
+
+const openReaderFromMessage = (message) => {
+  openReader({
+    topic: message.topic || '',
+    markdown: message.content,
+    meta: message.meta || {}
+  })
+}
+
+const closeReader = () => {
+  readerState.value = { ...readerState.value, open: false }
 }
 
 const scrollToBottom = () => {
@@ -196,7 +220,11 @@ const handleSend = async (text) => {
       role: 'assistant',
       content: response.reply,
       message_type: response.message_type,
-      tasks: response.tasks
+      tasks: response.tasks,
+      topic: response.message_type === 'research_report' ? text : undefined,
+      meta: response.message_type === 'research_report'
+        ? { taskCount: Object.keys(taskProgress.value).length, generatedAt: new Date().toISOString() }
+        : undefined
     }
   } catch (requestError) {
     if (!user.value) return
@@ -247,7 +275,7 @@ onBeforeUnmount(() => removeUnauthorizedHandler?.())
   <div v-else class="app">
     <header class="header">
       <div class="product-heading">
-        <span class="product-mark">LG</span>
+        <span class="product-seal">研</span>
         <div>
           <h1>深度研究工作区</h1>
           <p>{{ user.username }} 的私有资料与研究记录</p>
@@ -267,24 +295,17 @@ onBeforeUnmount(() => removeUnauthorizedHandler?.())
           v-for="(message, index) in messages"
           :key="index"
           :message="message"
+          @read-report="openReaderFromMessage"
         />
       </div>
     </main>
 
-    <section v-if="isLoading && progressItems.length" class="research-progress" aria-live="polite">
-      <div class="progress-heading">研究进度</div>
-      <div v-for="item in progressItems" :key="item.taskId" class="progress-row">
-        <span class="progress-task">{{ item.taskId.slice(0, 12) }}</span>
-        <span class="progress-status">{{ item.status }}</span>
-        <span v-if="item.attempt" class="progress-attempt">第 {{ item.attempt }} 次</span>
-        <span v-if="item.error" class="progress-error">{{ item.error }}</span>
-      </div>
-    </section>
-
-    <p v-if="documentRetrieval" class="retrieval-status" :class="{ degraded: documentRetrieval.reranker_status === 'degraded' }" aria-live="polite">
-      <template v-if="documentRetrieval.reranker_status === 'degraded'">私有资料精排不可用，当前按混合召回结果排序。</template>
-      <template v-else>已检索私有资料：{{ documentRetrieval.parent_count || 0 }} 个相关片段参与研究。</template>
-    </p>
+    <ResearchPipeline
+      v-if="(isLoading && progressItems.length) || documentRetrieval"
+      :tasks="progressItems"
+      :retrieval="documentRetrieval"
+      :active="isLoading"
+    />
 
     <DocumentScopeSelector
       :documents="documents"
@@ -298,40 +319,104 @@ onBeforeUnmount(() => removeUnauthorizedHandler?.())
 
     <ChatInput :disabled="isLoading || !sessionId" @send="handleSend" />
 
-    <HistoryPanel v-if="showHistory" @close="showHistory = false" />
+    <HistoryPanel v-if="showHistory" @close="showHistory = false" @read-report="openReader" />
     <DocumentPanel v-if="showDocuments" @close="showDocuments = false" @documents-updated="updateDocuments" />
+
+    <ReportReader
+      :open="readerState.open"
+      :topic="readerState.topic"
+      :markdown="readerState.markdown"
+      :meta="readerState.meta"
+      @close="closeReader"
+    />
   </div>
 </template>
 
 <style scoped>
-.bootstrap-view { display: grid; min-height: 100vh; place-items: center; background: var(--bg-primary); color: var(--text-secondary); font-size: 0.9rem; }
+.bootstrap-view {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  background: var(--ink-950);
+  color: var(--text-faint);
+  font-size: 0.9rem;
+  letter-spacing: 0.2em;
+}
+
 .app { display: flex; min-height: 100vh; flex-direction: column; }
-.header { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 13px 24px; border-bottom: 1px solid var(--border); background: var(--bg-secondary); }
-.product-heading { display: flex; min-width: 0; align-items: center; gap: 10px; }
-.product-mark { display: grid; width: 30px; height: 30px; flex: 0 0 auto; place-items: center; border: 1px solid var(--accent); border-radius: 4px; color: var(--accent-hover); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.64rem; font-weight: 700; }
-.header h1 { font-family: inherit; font-size: 1rem; }
-.header p { overflow: hidden; margin-top: 1px; color: var(--text-secondary); font-size: 0.7rem; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 档案柜顶栏 */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--ink-900);
+  padding: 13px 24px;
+}
+
+.product-heading { display: flex; min-width: 0; align-items: center; gap: 12px; }
+
+.product-seal {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--accent);
+  color: var(--paper);
+  font-family: var(--font-serif);
+  font-size: 1rem;
+  font-weight: 700;
+  box-shadow: inset 0 0 0 1.5px rgba(246, 241, 230, 0.35), 0 2px 10px rgba(192, 73, 47, 0.35);
+}
+
+.header h1 { font-size: 1.02rem; letter-spacing: 0.1em; }
+
+.header p {
+  overflow: hidden;
+  margin-top: 1px;
+  color: var(--text-faint);
+  font-size: 0.7rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .header-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
-.btn-header { min-height: 30px; padding: 5px 9px; border: 1px solid var(--border); border-radius: 4px; background: transparent; color: var(--text-secondary); font-size: 0.76rem; }
-.btn-header:hover { border-color: var(--accent); color: var(--text-primary); }
-.btn-header.subtle { color: #cbd5e1; }
-.chat-main { flex: 1; overflow-y: auto; padding: 24px; }
-.messages-container { display: flex; max-width: 800px; margin: 0 auto; flex-direction: column; gap: 16px; }
-.research-progress { width: min(800px, calc(100% - 48px)); margin: 0 auto 12px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-secondary); color: var(--text-secondary); font-size: 0.78rem; }
-.progress-heading { margin-bottom: 6px; color: var(--text-primary); font-weight: 600; }
-.progress-row { display: flex; min-height: 23px; align-items: center; gap: 10px; }
-.progress-task { min-width: 108px; color: var(--text-primary); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.progress-status { min-width: 74px; }
-.progress-error { overflow: hidden; color: #fca5a5; text-overflow: ellipsis; white-space: nowrap; }
-.retrieval-status { width: min(800px, calc(100% - 48px)); margin: 0 auto 10px; padding: 8px 10px; border-left: 2px solid var(--accent); background: rgba(30, 41, 59, 0.78); color: var(--text-secondary); font-size: 0.76rem; }
-.retrieval-status.degraded { border-left-color: #f7c873; color: #fde7b1; }
+
+.btn-header {
+  min-height: 30px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.76rem;
+  padding: 5px 11px;
+}
+
+.btn-header:hover {
+  border-color: var(--border-strong);
+  background: var(--ink-800);
+  color: var(--paper);
+}
+
+.btn-header.subtle:hover { border-color: rgba(209, 106, 90, 0.5); color: var(--error-text); }
+
+.chat-main { flex: 1; overflow-y: auto; padding: 26px 24px; }
+
+.messages-container {
+  display: flex;
+  max-width: 800px;
+  margin: 0 auto;
+  flex-direction: column;
+  gap: 18px;
+}
 
 @media (max-width: 720px) {
-  .header { align-items: flex-start; padding: 12px 16px; flex-direction: column; }
+  .header { align-items: flex-start; flex-direction: column; padding: 12px 16px; }
   .header-actions { justify-content: flex-start; }
   .chat-main { padding: 16px; }
-  .research-progress, .retrieval-status { width: min(100% - 32px, 800px); }
-  .progress-row { flex-wrap: wrap; gap: 3px 9px; }
-  .progress-error { max-width: 100%; white-space: normal; }
 }
 </style>
